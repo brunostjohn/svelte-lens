@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Svelte Lens",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Svelte 5 component inspection, reactive state traces, and time travel in Chrome DevTools.",
   "minimum_chrome_version": "116",
   "devtools_page": "src/devtools/devtools.html",

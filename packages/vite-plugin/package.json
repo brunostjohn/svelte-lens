@@ -1,6 +1,6 @@
 {
   "name": "svelte-lens-vite",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Development-only Vite instrumentation for the Svelte Lens Chrome DevTools extension.",
   "type": "module",
   "types": "./dist/index.d.ts",
