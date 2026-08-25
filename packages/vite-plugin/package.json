@@ -1,0 +1,24 @@
+{
+  "name": "@svelte-lens/vite-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run test"
+  },
+  "dependencies": {
+    "magic-string": "^0.30.17",
+    "svelte": "^5.56.9"
+  },
+  "devDependencies": {
+    "vite": "^7.3.2"
+  }
+}

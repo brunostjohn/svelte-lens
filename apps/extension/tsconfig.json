@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "types": ["chrome", "svelte", "vite/client"]
+  },
+  "include": ["src/panel/**/*.svelte", "src/panel/**/*.ts", "src/shared/**/*.ts", "src/vite-env.d.ts"]
+}
