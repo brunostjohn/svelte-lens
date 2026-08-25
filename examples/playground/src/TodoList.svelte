@@ -9,6 +9,11 @@
   ]);
   let remaining = $derived(todos.filter((todo) => !todo.done).length);
 
+  $effect(() => {
+    const firstDone = draft.length > 0 ? todos[0]?.done ?? null : null;
+    document.documentElement.dataset.svelteLensTodoEffect = `${remaining}:${draft.length}:${firstDone}`;
+  });
+
   function add() {
     const text = draft.trim();
     if (!text) return;

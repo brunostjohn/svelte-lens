@@ -10,13 +10,15 @@ The release workflow is `.github/workflows/release.yml`.
 ## Release
 
 1. Update the version in:
+   - `package.json`
    - `packages/vite-plugin/package.json`
    - `apps/extension/package.json`
    - `apps/extension/src/manifest.json`
+   - `examples/playground/package.json`
 2. Run `pnpm install` so the lockfile records the package versions.
 3. Run `pnpm test`, `pnpm check`, and `pnpm build`.
 4. Commit the release and push `main`.
-5. Create and push the matching tag, such as `v0.1.1`.
+5. Create and push the matching tag, such as `v0.2.0`.
 
 The workflow uploads:
 

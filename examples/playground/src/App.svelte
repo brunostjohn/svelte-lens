@@ -6,6 +6,10 @@
   let showSecond = $state(true);
   let interactions = $state(0);
 
+  $effect.pre(() => {
+    document.documentElement.dataset.svelteLensAppPreEffect = `${accent}:${showSecond}`;
+  });
+
   function randomizeAccent() {
     const colors = ['#ff3e78', '#40b3ff', '#a78bfa', '#f59e0b'];
     accent = colors[Math.floor(Math.random() * colors.length)] ?? colors[0]!;

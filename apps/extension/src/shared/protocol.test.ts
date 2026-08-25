@@ -18,7 +18,8 @@ const hello = pageMessage('doc-1', {
       picker: true,
       trace: true,
       state: false,
-      timeTravel: false
+      timeTravel: false,
+      effects: true
     }
   }
 });
@@ -34,6 +35,17 @@ describe('extension protocol guards', () => {
   it('rejects spoofed channels, versions, and cyclic payloads', () => {
     expect(isPageToContentMessage({ ...hello, source: 'host-page' })).toBe(false);
     expect(isPageToContentMessage({ ...hello, v: 99 })).toBe(false);
+    if (hello.event.type !== 'hello') throw new Error('Expected hello fixture');
+    expect(isPageToContentMessage({
+      ...hello,
+      event: {
+        ...hello.event,
+        payload: {
+          ...hello.event.payload,
+          capabilities: { ...hello.event.payload.capabilities, effects: 'yes' }
+        }
+      }
+    })).toBe(false);
 
     const cyclic: Record<string, unknown> = { ...hello };
     cyclic.self = cyclic;

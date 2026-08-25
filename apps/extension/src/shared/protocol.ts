@@ -42,6 +42,7 @@ export interface HelloPayload {
     trace: boolean;
     state: boolean;
     timeTravel: boolean;
+    effects?: boolean;
   };
 }
 
@@ -324,7 +325,8 @@ function isHelloPayload(value: unknown): value is HelloPayload {
     typeof capabilities.picker === 'boolean' &&
     typeof capabilities.trace === 'boolean' &&
     typeof capabilities.state === 'boolean' &&
-    typeof capabilities.timeTravel === 'boolean'
+    typeof capabilities.timeTravel === 'boolean' &&
+    (capabilities.effects === undefined || typeof capabilities.effects === 'boolean')
   );
 }
 

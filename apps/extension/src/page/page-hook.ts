@@ -16,7 +16,17 @@ const MAX_COMPONENTS = 5_000;
 const MAX_ELEMENTS = 12_000;
 const MAX_TRACE_HISTORY = 1_000;
 const MAX_TRACE_BATCH = 256;
+const MAX_TRACE_DETAIL_JSON_NODES = 8_000;
+const MAX_TRACE_DETAIL_JSON_CHARS = 100_000;
+const MAX_TRACE_HISTORY_JSON_CHARS = 8_000_000;
+const MAX_TRACE_BATCH_JSON_CHARS = 1_500_000;
 const MAX_CHECKPOINTS = 40;
+const MAX_EFFECTS = 1_000;
+const MAX_EFFECTS_PER_COMPONENT = 200;
+const MAX_EFFECT_DEPENDENCIES = 60;
+const MAX_EFFECT_DEPENDENCY_DEPTH = 8;
+const MAX_EFFECT_RUNS = 20;
+const MAX_EFFECT_RUNTIMES = 8;
 const MAX_RECTS = 64;
 const MAX_PREVIEW_DEPTH = 5;
 const MAX_PREVIEW_ITEMS = 80;
@@ -46,11 +56,24 @@ interface SvelteElementMeta {
 
 interface StateAdapter {
   get(): unknown;
+  canSet?(): boolean;
   set?: (value: unknown) => void;
 }
 
 interface ReadAdapter {
   get(): unknown;
+}
+
+function isWritableStateAdapter(
+  adapter: StateAdapter
+): adapter is StateAdapter & { set(value: unknown): void } {
+  if (typeof adapter.set !== 'function') return false;
+  if (adapter.canSet === undefined) return true;
+  try {
+    return adapter.canSet() === true;
+  } catch {
+    return false;
+  }
 }
 
 interface ComponentDescriptor {
@@ -61,11 +84,105 @@ interface ComponentDescriptor {
   derived: Record<string, ReadAdapter>;
 }
 
+interface EffectDescriptor {
+  siteId: string;
+  componentId: string | null;
+  kind: 'effect' | 'pre';
+  source: SourceLocation;
+}
+
+interface EffectRuntimeAdapter {
+  activeEffect: unknown;
+  untrack: <Value>(read: () => Value) => Value;
+  enableTracing?: () => unknown;
+}
+
+type EffectRuntimeResolver = () => EffectRuntimeAdapter | null;
+
+interface DependencyBaseline {
+  id: string;
+  value: JsonValue;
+  writeVersion: number;
+}
+
+interface CapturedDependency {
+  signal: object;
+  id: string;
+  label: string;
+  kind: 'state' | 'derived' | 'store' | 'unknown';
+  value: JsonValue;
+  writeVersion: number;
+  dirty: boolean;
+  depth: number;
+  direct: boolean;
+  parentId: string | null;
+  createdAt?: string;
+  updatedAt?: string[];
+}
+
+interface DependencyCapture {
+  dependencies: CapturedDependency[];
+  directCount: number;
+  truncated: boolean;
+}
+
+interface DependencyCaptureOptions {
+  includeCreatedStacks: boolean;
+  includeUpdatedStacks: boolean;
+}
+
+interface BoundedObjectArray {
+  values: object[];
+  length: number;
+  truncated: boolean;
+}
+
+interface EffectRecord {
+  id: string;
+  descriptor: EffectDescriptor;
+  componentId: string | null;
+  parentEffectId: string | null;
+  registeredAt: number;
+  status: 'active' | 'error' | 'disposed';
+  runCount: number;
+  capturedRunCount: number;
+  timedRunCount: number;
+  cleanupCount: number;
+  cleanupRegistered: boolean | null;
+  errorCount: number;
+  totalSyncDurationMs: number;
+  maxSyncDurationMs: number;
+  lastSyncDurationMs: number | null;
+  lastRunAt: number | null;
+  lastRunId: string | null;
+  adapterStatus: 'exact' | 'unavailable';
+  captureGap: boolean;
+  effectObject: object | null;
+  runtimeAdapter: EffectRuntimeAdapter | null;
+  baselines: Map<object, DependencyBaseline>;
+  dependencies: JsonValue[];
+  triggers: JsonValue[];
+  addedDependencyIds: string[];
+  removedDependencyIds: string[];
+  recentRuns: JsonValue[];
+  lastError: JsonValue | null;
+  lastOutcome: 'ok' | 'error' | null;
+  directDependencyCount: number;
+  dependencyTruncated: boolean;
+  pendingFinalize: ((overlapped: boolean) => void) | null;
+  pendingTriggerCapture: DependencyCapture | null;
+}
+
 interface SvelteLensHook {
   beginComponent(descriptor: ComponentDescriptor): string | null;
   endComponent(id: string | null): void;
   updateComponent(id: string | null, phase?: 'init' | 'update'): void;
   unregisterComponent(id: string | null): void;
+  abortComponent(id: string | null, error?: unknown): void;
+  canReplaceStateInPlace(value: unknown): boolean;
+  replaceStateInPlace(target: unknown, replacement: unknown): void;
+  installRuntime(resolve: EffectRuntimeResolver): void;
+  registerEffect(descriptor: EffectDescriptor, callback: unknown): unknown;
 }
 
 interface StoredValue {
@@ -102,6 +219,7 @@ interface ComponentRecord {
   bounds: Set<Element>;
   checkpoints: Checkpoint[];
   lastPreview: Map<string, string>;
+  effects: Set<string>;
 }
 
 interface CloneResult {
@@ -117,6 +235,7 @@ interface CloneBudget {
 
 interface PreviewBudget {
   nodes: number;
+  chars: number;
   seen: Map<object, number>;
   nextRef: number;
 }
@@ -157,6 +276,53 @@ declare global {
   }
 }
 
+type ReplaceableState = Record<string, unknown> | unknown[];
+
+function canReplaceStateInPlace(value: unknown): value is ReplaceableState {
+  if (!isObjectValue(value)) return false;
+  if (Array.isArray(value)) return true;
+  try {
+    return Object.getPrototypeOf(value) === Object.prototype;
+  } catch {
+    return false;
+  }
+}
+
+function replaceStateInPlace(target: unknown, replacement: unknown): void {
+  if (!canReplaceStateInPlace(target) || !canReplaceStateInPlace(replacement)) {
+    throw new TypeError('Direct proxy state can only restore plain objects or arrays');
+  }
+  if (Array.isArray(target) !== Array.isArray(replacement)) {
+    throw new TypeError('Direct proxy state cannot change between object and array shapes');
+  }
+
+  const replacementKeys = Object.keys(replacement);
+  for (const key of replacementKeys) {
+    if (DANGEROUS_PATH_KEYS.has(key)) {
+      throw new TypeError(`State key "${key}" is not safe to replace`);
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(replacement, key);
+    if (!descriptor || !('value' in descriptor)) {
+      throw new TypeError(`State key "${key}" is not a data property`);
+    }
+  }
+
+  const nextKeys = new Set(replacementKeys);
+  for (const key of Object.keys(target)) {
+    if (DANGEROUS_PATH_KEYS.has(key) || nextKeys.has(key)) continue;
+    if (!Reflect.deleteProperty(target, key)) {
+      throw new TypeError(`State key "${key}" could not be removed`);
+    }
+  }
+  for (const key of replacementKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(replacement, key);
+    if (!descriptor || !('value' in descriptor) || !Reflect.set(target, key, descriptor.value)) {
+      throw new TypeError(`State key "${key}" could not be replaced`);
+    }
+  }
+  if (Array.isArray(target) && Array.isArray(replacement)) target.length = replacement.length;
+}
+
 bootstrap();
 
 function bootstrap(): void {
@@ -185,13 +351,24 @@ function bootstrap(): void {
   const observedRoots = new Set<Document | ShadowRoot>([document]);
   const traceHistory: TraceRecord[] = [];
   const traceBatch: TraceRecord[] = [];
+  const traceJsonSizes = new WeakMap<TraceRecord, number>();
   const liveBaselines = new Map<string, StoredState>();
+  const effectRecords = new Map<string, EffectRecord>();
+  const omittedEffectsByComponent = new Map<string, number>();
+  const effectByReaction = new WeakMap<object, EffectRecord>();
+  const signalIds = new WeakMap<object, string>();
+  const runtimeResolvers: EffectRuntimeResolver[] = [];
+  const runtimeUntracks = new WeakSet<Function>();
+  const tracingEnabledRuntimes = new WeakSet<Function>();
 
   let componentCounter = 0;
   let elementCounter = 0;
   let entryCounter = 0;
   let traceCounter = 0;
+  let traceHistoryJsonChars = 0;
   let checkpointCounter = 0;
+  let effectCounter = 0;
+  let signalCounter = 0;
   let timelineCursor = 0;
   let snapshotRevision = 0;
   let connected = false;
@@ -221,7 +398,12 @@ function bootstrap(): void {
     beginComponent,
     endComponent,
     updateComponent,
-    unregisterComponent
+    unregisterComponent,
+    abortComponent,
+    canReplaceStateInPlace,
+    replaceStateInPlace,
+    installRuntime,
+    registerEffect
   };
 
   const sentinel: RuntimeSentinel = {
@@ -270,6 +452,785 @@ function bootstrap(): void {
   // The content script also sends `connect`; this is useful when it was already listening.
   emitHello(true);
 
+  function installRuntime(resolve: EffectRuntimeResolver): void {
+    if (typeof resolve !== 'function' || runtimeResolvers.length >= MAX_EFFECT_RUNTIMES) return;
+    try {
+      const candidate = resolve();
+      if (!isEffectRuntimeAdapter(candidate) || runtimeUntracks.has(candidate.untrack)) return;
+      runtimeUntracks.add(candidate.untrack);
+      runtimeResolvers.push(resolve);
+      if (recording) enableRuntimeTracing();
+      emitHello();
+    } catch {
+      // A mismatched private runtime adapter must never affect the inspected app.
+    }
+  }
+
+  function enableRuntimeTracing(): void {
+    for (const resolve of runtimeResolvers) {
+      try {
+        const adapter = resolve();
+        if (!isEffectRuntimeAdapter(adapter)) continue;
+        const enable = adapter?.enableTracing;
+        if (typeof enable !== 'function' || tracingEnabledRuntimes.has(adapter.untrack)) continue;
+        tracingEnabledRuntimes.add(adapter.untrack);
+        const result = enable();
+        void Promise.resolve(result).catch(() => tracingEnabledRuntimes.delete(adapter.untrack));
+      } catch {
+        // Tracing stacks are optional; lifecycle and dependency capture continue.
+      }
+    }
+  }
+
+  function registerEffect(candidate: EffectDescriptor, callback: unknown): unknown {
+    try {
+      if (typeof callback !== 'function' || !isEffectDescriptor(candidate)) return callback;
+      if (!ensureEffectCapacity(candidate.componentId)) {
+        noteOmittedEffect(candidate.componentId);
+        return callback;
+      }
+
+      const record: EffectRecord = {
+      id: `fx:${sessionId.slice(0, 8)}:${++effectCounter}`,
+      descriptor: copyEffectDescriptor(candidate),
+      componentId: candidate.componentId,
+      parentEffectId: null,
+      registeredAt: Date.now(),
+      status: 'active',
+      runCount: 0,
+      capturedRunCount: 0,
+      timedRunCount: 0,
+      cleanupCount: 0,
+      cleanupRegistered: null,
+      errorCount: 0,
+      totalSyncDurationMs: 0,
+      maxSyncDurationMs: 0,
+      lastSyncDurationMs: null,
+      lastRunAt: null,
+      lastRunId: null,
+      adapterStatus: 'unavailable',
+      captureGap: false,
+      effectObject: null,
+      runtimeAdapter: null,
+      baselines: new Map(),
+      dependencies: [],
+      triggers: [],
+      addedDependencyIds: [],
+      removedDependencyIds: [],
+      recentRuns: [],
+      lastError: null,
+      lastOutcome: null,
+      directDependencyCount: 0,
+      dependencyTruncated: false,
+      pendingFinalize: null,
+      pendingTriggerCapture: null
+      };
+      effectRecords.set(record.id, record);
+      attachEffectToComponent(record);
+
+      const original = callback as (...args: unknown[]) => unknown;
+      return function svelteLensEffect(this: unknown, ...args: unknown[]): unknown {
+        return runEffect(record, original, this, args);
+      };
+    } catch {
+      return callback;
+    }
+  }
+
+  function ensureEffectCapacity(componentId: string | null): boolean {
+    const component = componentId ? components.get(componentId) : null;
+    if (effectRecords.size < MAX_EFFECTS && (!component || component.effects.size < MAX_EFFECTS_PER_COMPONENT)) {
+      return true;
+    }
+    for (const [id, record] of effectRecords) {
+      refreshEffectStatus(record);
+      if (record.status !== 'disposed') continue;
+      removeEffectRecord(id);
+      if (effectRecords.size < MAX_EFFECTS && (!component || component.effects.size < MAX_EFFECTS_PER_COMPONENT)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function noteOmittedEffect(componentId: string | null): void {
+    if (!componentId) return;
+    const count = (omittedEffectsByComponent.get(componentId) ?? 0) + 1;
+    omittedEffectsByComponent.set(componentId, count);
+    if (count === 1) {
+      const component = components.get(componentId);
+      pushTrace('effect-capacity', componentId, {
+        reason: component && component.effects.size >= MAX_EFFECTS_PER_COMPONENT
+          ? 'component-effect-limit'
+          : 'global-effect-limit',
+        omittedCount: count
+      });
+    }
+    if (recording) scheduleSnapshot();
+  }
+
+  function attachEffectToComponent(record: EffectRecord): void {
+    if (!record.componentId) return;
+    const component = components.get(record.componentId);
+    if (component && component.effects.size < MAX_EFFECTS_PER_COMPONENT) component.effects.add(record.id);
+  }
+
+  function removeEffectRecord(id: string): void {
+    const record = effectRecords.get(id);
+    if (!record) return;
+    // Error boundaries can tear down a component synchronously after an effect
+    // callback throws. Settle the terminal receipt while the record and owning
+    // component still exist so that run cannot disappear with the teardown.
+    record.pendingFinalize?.(false);
+    record.status = 'disposed';
+    record.baselines.clear();
+    if (record.componentId) components.get(record.componentId)?.effects.delete(id);
+    effectRecords.delete(id);
+  }
+
+  function runEffect(
+    record: EffectRecord,
+    original: (...args: unknown[]) => unknown,
+    thisArg: unknown,
+    args: unknown[]
+  ): unknown {
+    // Svelte can synchronously flush the same effect again before our queued
+    // post-commit read runs. Settle the older receipt as overlapped now so it
+    // cannot read the newer run's mutable reaction state and invent a baseline.
+    record.pendingFinalize?.(true);
+    record.runCount++;
+    const runAt = Date.now();
+    record.lastRunAt = runAt;
+    const runIndex = record.runCount;
+    const phase = runIndex === 1 ? 'initial' : 'rerun';
+    const captureEnabled = recording;
+    const runtime = findActiveEffectRuntime();
+    const effect = runtime?.effect ?? null;
+    if (effect) bindEffectReaction(record, effect);
+    if (runtime) record.runtimeAdapter = runtime.adapter;
+    record.adapterStatus = runtime ? 'exact' : 'unavailable';
+    record.status = 'active';
+    record.lastError = null;
+
+    const effectWriteVersion = effect ? readFiniteProperty(effect, 'wv') : null;
+    const cleanupTriggerCapture = record.pendingTriggerCapture;
+    record.pendingTriggerCapture = null;
+    const entryDependencies = cleanupTriggerCapture ?? (
+      captureEnabled && runtime && effect && effectWriteVersion !== null
+        ? captureWithRuntime(runtime.adapter, effect, effectWriteVersion, {
+            includeCreatedStacks: false,
+            includeUpdatedStacks: true
+          })
+        : emptyDependencyCapture()
+    );
+    const startedAt = captureEnabled ? performance.now() : 0;
+    let result: unknown;
+    let thrown: unknown = undefined;
+    let didThrow = false;
+
+    try {
+      result = Reflect.apply(original, thisArg, args);
+    } catch (error) {
+      didThrow = true;
+      thrown = error;
+      record.errorCount++;
+      record.status = 'error';
+      record.lastError = effectErrorDetail(error);
+      throw error;
+    } finally {
+      record.lastOutcome = didThrow ? 'error' : 'ok';
+      record.cleanupRegistered = typeof result === 'function';
+      if (!captureEnabled) {
+        record.captureGap = true;
+        record.dependencies = [];
+        record.directDependencyCount = 0;
+        record.dependencyTruncated = true;
+        record.triggers = [];
+        record.addedDependencyIds = [];
+        record.removedDependencyIds = [];
+        record.lastSyncDurationMs = null;
+        record.lastRunId = null;
+      } else {
+        const duration = Math.max(0, performance.now() - startedAt);
+        record.lastSyncDurationMs = duration;
+        record.timedRunCount++;
+        record.totalSyncDurationMs += duration;
+        record.maxSyncDurationMs = Math.max(record.maxSyncDurationMs, duration);
+        const afterDependencies = runtime && effect && effectWriteVersion !== null
+          ? captureWithRuntime(runtime.adapter, effect, effectWriteVersion, {
+              includeCreatedStacks: false,
+              includeUpdatedStacks: false
+            })
+          : emptyDependencyCapture();
+        const error = didThrow ? effectErrorDetail(thrown) : null;
+        let settled = false;
+        const finalize = (overlapped: boolean): void => {
+          if (settled) return;
+          settled = true;
+          if (record.pendingFinalize === finalize) record.pendingFinalize = null;
+          try {
+            finalizeEffectRun(
+              record,
+              runtime,
+              effect,
+              runIndex,
+              phase,
+              duration,
+              entryDependencies,
+              afterDependencies,
+              error,
+              typeof result === 'function',
+              runAt,
+              overlapped
+            );
+          } catch {
+            record.adapterStatus = 'unavailable';
+          }
+        };
+        record.pendingFinalize = finalize;
+        queueMicrotask(() => finalize(false));
+      }
+    }
+
+    return typeof result === 'function'
+      ? wrapEffectCleanup(record, result as (...args: unknown[]) => unknown, runIndex)
+      : result;
+  }
+
+  function wrapEffectCleanup(
+    record: EffectRecord,
+    cleanup: (...args: unknown[]) => unknown,
+    originatingRun: number
+  ): (...args: unknown[]) => unknown {
+    return function svelteLensEffectCleanup(this: unknown, ...args: unknown[]): unknown {
+      record.cleanupCount++;
+      const captureEnabled = recording;
+      // Svelte executes teardown after selecting an effect but before running
+      // its callback. Snapshot dirty dependencies before user cleanup writes so
+      // those writes cannot be misreported as causes of the already-selected run.
+      record.pendingFinalize?.(true);
+      const runtime = captureEnabled ? findActiveEffectRuntime() : null;
+      const effectWriteVersion = runtime ? readFiniteProperty(runtime.effect, 'wv') : null;
+      const triggerRecord = runtime ? effectByReaction.get(runtime.effect) ?? record : record;
+      if (triggerRecord !== record) triggerRecord.pendingFinalize?.(true);
+      const triggerCapture = runtime && effectWriteVersion !== null
+        ? captureWithRuntime(runtime.adapter, runtime.effect, effectWriteVersion, {
+            includeCreatedStacks: false,
+            includeUpdatedStacks: true
+          })
+        : null;
+      if (triggerCapture && triggerRecord.pendingTriggerCapture === null) {
+        triggerRecord.pendingTriggerCapture = triggerCapture;
+        queueMicrotask(() => {
+          if (triggerRecord.pendingTriggerCapture === triggerCapture) {
+            triggerRecord.pendingTriggerCapture = null;
+          }
+        });
+      }
+      const startedAt = captureEnabled ? performance.now() : 0;
+      let outcome: 'ok' | 'error' = 'ok';
+      let errorDetail: JsonValue | null = null;
+      try {
+        return Reflect.apply(cleanup, this, args);
+      } catch (error) {
+        outcome = 'error';
+        record.errorCount++;
+        record.status = 'error';
+        errorDetail = effectErrorDetail(error);
+        record.lastError = errorDetail;
+        throw error;
+      } finally {
+        if (captureEnabled) {
+          const detail: Record<string, JsonValue> = {
+            effectId: record.id,
+            siteId: record.descriptor.siteId,
+            kind: record.descriptor.kind,
+            source: { ...record.descriptor.source },
+            originatingRun,
+            cleanupCount: record.cleanupCount,
+            syncDurationMs: Math.max(0, performance.now() - startedAt),
+            outcome
+          };
+          if (errorDetail !== null) detail.error = errorDetail;
+          pushTrace('effect-cleanup', record.componentId ?? undefined, detail);
+          scheduleSnapshot();
+        }
+      }
+    };
+  }
+
+  function findActiveEffectRuntime(): { adapter: EffectRuntimeAdapter; effect: object } | null {
+    if (!supportsEffectRuntimeVersion()) return null;
+    for (const resolve of runtimeResolvers) {
+      try {
+        const adapter = resolve();
+        if (!isEffectRuntimeAdapter(adapter) || !isEffectObject(adapter.activeEffect)) continue;
+        return { adapter, effect: adapter.activeEffect };
+      } catch {
+        // Try another installed Svelte runtime if this one is inactive or changed shape.
+      }
+    }
+    return null;
+  }
+
+  function supportsEffectRuntimeVersion(): boolean {
+    const version = readSvelteVersion();
+    if (version === null) return true;
+    return version.split(',').some((candidate) => {
+      const normalized = candidate.trim();
+      // Svelte's public dev marker currently exposes the major version only.
+      // Accepting `5` is therefore the real-world path; a full version, when a
+      // host supplies one, still gets the private-shape compatibility floor.
+      if (normalized === '5') return true;
+      const match = /^5\.(\d+)(?:\.|$)/.exec(normalized);
+      return Boolean(match && Number(match[1]) >= 39);
+    });
+  }
+
+  function bindEffectReaction(record: EffectRecord, effect: object): void {
+    if (record.effectObject === null) {
+      record.effectObject = effect;
+      effectByReaction.set(effect, record);
+      let parent = readObjectProperty(effect, 'parent');
+      const seen = new Set<object>();
+      while (parent && seen.size < MAX_STACK_DEPTH && !seen.has(parent)) {
+        seen.add(parent);
+        const owner = effectByReaction.get(parent);
+        if (owner && owner !== record) {
+          record.parentEffectId = owner.id;
+          break;
+        }
+        parent = readObjectProperty(parent, 'parent');
+      }
+    }
+  }
+
+  function emptyDependencyCapture(): DependencyCapture {
+    return { dependencies: [], directCount: 0, truncated: false };
+  }
+
+  function createEffectPreviewBudget(): PreviewBudget {
+    return { nodes: 600, chars: 24_000, seen: new Map(), nextRef: 1 };
+  }
+
+  function createEffectStackBudget(): PreviewBudget {
+    return { nodes: 200, chars: 48_000, seen: new Map(), nextRef: 1 };
+  }
+
+  function captureDependencies(
+    effect: object,
+    effectWriteVersion: number,
+    previewBudget: PreviewBudget,
+    stackBudget: PreviewBudget,
+    options: DependencyCaptureOptions
+  ): DependencyCapture {
+    const directRead = readBoundedArrayProperty(effect, 'deps', MAX_EFFECT_DEPENDENCIES);
+    if (!directRead) return emptyDependencyCapture();
+    const direct = directRead.values;
+    const captured: CapturedDependency[] = [];
+    const seen = new Set<object>();
+    const directSignals = new Set(direct);
+    const derivedQueue: Array<{ signal: object; depth: number; parentId: string }> = [];
+    let queueIndex = 0;
+    let truncated = directRead.truncated;
+
+    const capture = (
+      signal: object,
+      depth: number,
+      isDirect: boolean,
+      parentId: string | null
+    ): void => {
+      if (seen.has(signal) || captured.length >= MAX_EFFECT_DEPENDENCIES) return;
+      seen.add(signal);
+      const id = getSignalId(signal);
+      const flags = readFiniteProperty(signal, 'f') ?? 0;
+      const writeVersion = readFiniteProperty(signal, 'wv') ?? 0;
+      const labelValue = readDataProperty(signal, 'label');
+      const label = typeof labelValue === 'string' && labelValue.length > 0
+        ? truncate(labelValue, 512)
+        : `signal ${id.split(':').at(-1) ?? id}`;
+      const childrenRead = (flags & 2) !== 0
+        ? readBoundedArrayProperty(signal, 'deps', MAX_EFFECT_DEPENDENCIES)
+        : null;
+      const children = childrenRead?.values ?? null;
+      if (childrenRead?.truncated) truncated = true;
+      const kind = (flags & 2) !== 0
+        ? 'derived'
+        : label.startsWith('$')
+          ? 'store'
+          : 'state';
+      previewBudget.seen.clear();
+      previewBudget.nextRef = 1;
+      const dependency: CapturedDependency = {
+        signal,
+        id,
+        label,
+        kind,
+        value: effectPreview(readDataProperty(signal, 'v'), previewBudget),
+        writeVersion,
+        dirty: effectWriteVersion !== 0 && writeVersion > effectWriteVersion,
+        depth,
+        direct: isDirect,
+        parentId
+      };
+      if (options.includeCreatedStacks && captured.length < 10) {
+        const createdAt = readErrorStack(readDataProperty(signal, 'created'), stackBudget);
+        if (createdAt) dependency.createdAt = createdAt;
+      }
+      if (options.includeUpdatedStacks) {
+        const updatedAt = readUpdatedStacks(readDataProperty(signal, 'updated'), stackBudget);
+        if (updatedAt.length > 0) dependency.updatedAt = updatedAt;
+      }
+      captured.push(dependency);
+
+      if (children && depth < MAX_EFFECT_DEPENDENCY_DEPTH) {
+        const childLimit = Math.min(children.length, MAX_EFFECT_DEPENDENCIES);
+        if (children.length > childLimit) truncated = true;
+        for (let index = 0; index < childLimit; index++) {
+          const child = children[index];
+          // Direct reads win over derived expansion, even when the same signal
+          // appears earlier through a derived's dependency graph.
+          if (isObjectValue(child) && !directSignals.has(child)) {
+            derivedQueue.push({ signal: child, depth: depth + 1, parentId: id });
+          }
+        }
+      } else if (children && children.length > 0) {
+        truncated = true;
+      }
+    };
+
+    // Preserve the runtime's direct dependency order and reserve the whole
+    // budget for direct reads before recursively expanding derived sources.
+    for (const signal of direct) {
+      if (captured.length >= MAX_EFFECT_DEPENDENCIES) break;
+      capture(signal, 0, true, null);
+    }
+
+    while (queueIndex < derivedQueue.length && captured.length < MAX_EFFECT_DEPENDENCIES) {
+      const item = derivedQueue[queueIndex++];
+      if (item) capture(item.signal, item.depth, false, item.parentId);
+    }
+    if (queueIndex < derivedQueue.length) truncated = true;
+    return { dependencies: captured, directCount: directRead.length, truncated };
+  }
+
+  function captureWithRuntime(
+    adapter: EffectRuntimeAdapter,
+    effect: object,
+    effectWriteVersion: number,
+    options: DependencyCaptureOptions = {
+      includeCreatedStacks: true,
+      includeUpdatedStacks: true
+    }
+  ): DependencyCapture {
+    try {
+      return adapter.untrack(() => captureDependencies(
+        effect,
+        effectWriteVersion,
+        createEffectPreviewBudget(),
+        createEffectStackBudget(),
+        options
+      ));
+    } catch {
+      return { dependencies: [], directCount: 0, truncated: true };
+    }
+  }
+
+  function resumeEffectCapture(record: EffectRecord): void {
+    refreshEffectStatus(record);
+    if (record.status === 'disposed' || !record.effectObject || !record.runtimeAdapter) return;
+    const effectWriteVersion = readFiniteProperty(record.effectObject, 'wv');
+    if (effectWriteVersion === null) return;
+    const capture = captureWithRuntime(record.runtimeAdapter, record.effectObject, effectWriteVersion);
+    const baselines = new Map<object, DependencyBaseline>();
+    for (const dependency of capture.dependencies) {
+      baselines.set(dependency.signal, {
+        id: dependency.id,
+        value: dependency.value,
+        writeVersion: dependency.writeVersion
+      });
+    }
+    record.baselines = baselines;
+    record.dependencies = capture.dependencies.map(dependencyDetail);
+    record.directDependencyCount = capture.directCount;
+    record.dependencyTruncated = capture.truncated;
+    record.adapterStatus = 'exact';
+    record.captureGap = false;
+    // The graph above is a fresh resume baseline, not evidence for the latest
+    // callback execution. Do not combine it with an older run's cause/timing.
+    record.triggers = [];
+    record.addedDependencyIds = [];
+    record.removedDependencyIds = [];
+    record.lastSyncDurationMs = null;
+    record.lastRunId = null;
+  }
+
+  function finalizeEffectRun(
+    record: EffectRecord,
+    runtime: { adapter: EffectRuntimeAdapter; effect: object } | null,
+    effect: object | null,
+    runIndex: number,
+    phase: 'initial' | 'rerun',
+    duration: number,
+    entryDependencies: DependencyCapture,
+    afterDependencies: DependencyCapture,
+    error: JsonValue | null,
+    cleanupRegistered: boolean,
+    runAt: number,
+    overlapped: boolean
+  ): void {
+    if (effectRecords.get(record.id) !== record || !recording) return;
+    const hadCaptureGap = record.captureGap || overlapped;
+    const previousBaselines = record.baselines;
+    const committedWriteVersion = effect ? readFiniteProperty(effect, 'wv') : null;
+    const committedCapture = !overlapped && runtime && effect && committedWriteVersion !== null
+      ? captureWithRuntime(runtime.adapter, effect, committedWriteVersion)
+      : { dependencies: [], directCount: 0, truncated: overlapped };
+    const committed = committedCapture.dependencies;
+    const afterById = new Map(
+      afterDependencies.dependencies.map((dependency) => [dependency.id, dependency])
+    );
+    const triggers: JsonValue[] = [];
+    if (phase === 'rerun') {
+      for (const entry of entryDependencies.dependencies) {
+        if (!entry.dirty) continue;
+        const latest = afterById.get(entry.id) ?? entry;
+        const baseline = previousBaselines.get(entry.signal);
+        const trigger: Record<string, JsonValue> = {
+          id: entry.id,
+          label: entry.label,
+          kind: entry.kind,
+          invalidated: true,
+          direct: entry.direct,
+          current: entry.value,
+          writeVersion: entry.writeVersion,
+          previewChanged: hadCaptureGap || !baseline
+            ? null
+            : jsonPreviewKey(baseline.value) !== jsonPreviewKey(entry.value)
+        };
+        if (
+          latest.writeVersion !== entry.writeVersion ||
+          jsonPreviewKey(latest.value) !== jsonPreviewKey(entry.value)
+        ) {
+          trigger.afterCallback = latest.value;
+          trigger.afterCallbackWriteVersion = latest.writeVersion;
+        }
+        if (entry.parentId) trigger.viaDerivedId = entry.parentId;
+        if (!hadCaptureGap && baseline) trigger.before = baseline.value;
+        if (entry.updatedAt && entry.updatedAt.length > 0) trigger.updatedAt = entry.updatedAt;
+        triggers.push(trigger);
+      }
+    }
+
+    const previousIds = new Set(Array.from(previousBaselines.values(), (baseline) => baseline.id));
+    const committedIds = new Set(committed.map((dependency) => dependency.id));
+    const addedDependencyIds = hadCaptureGap
+      ? []
+      : Array.from(committedIds).filter((id) => !previousIds.has(id));
+    const removedDependencyIds = hadCaptureGap
+      ? []
+      : Array.from(previousIds).filter((id) => !committedIds.has(id));
+    const nextBaselines = new Map<object, DependencyBaseline>();
+    for (const dependency of committed) {
+      nextBaselines.set(dependency.signal, {
+        id: dependency.id,
+        value: dependency.value,
+        writeVersion: dependency.writeVersion
+      });
+    }
+    if (!overlapped) {
+      record.baselines = nextBaselines;
+      record.dependencies = committed.map(dependencyDetail);
+      record.directDependencyCount = committedCapture.directCount;
+      record.dependencyTruncated = committedCapture.truncated;
+    }
+    record.triggers = triggers;
+    record.addedDependencyIds = addedDependencyIds;
+    record.removedDependencyIds = removedDependencyIds;
+    record.captureGap = overlapped;
+    if (!overlapped) record.capturedRunCount++;
+    refreshEffectStatus(record);
+
+    const reason = hadCaptureGap
+      ? 'capture-gap'
+      : phase === 'initial'
+        ? 'initial'
+        : triggers.length > 0
+          ? 'dependencies'
+          : runtime
+            ? 'runtime-scheduled'
+            : 'runtime-unavailable';
+    const detail: Record<string, JsonValue> = {
+      effectId: record.id,
+      siteId: record.descriptor.siteId,
+      kind: record.descriptor.kind,
+      source: { ...record.descriptor.source },
+      parentEffectId: record.parentEffectId,
+      runCount: runIndex,
+      rerunCount: Math.max(0, runIndex - 1),
+      capturedRunCount: record.capturedRunCount,
+      timedRunCount: record.timedRunCount,
+      phase,
+      reason,
+      syncDurationMs: duration,
+      outcome: error === null ? 'ok' : 'error',
+      cleanupRegistered,
+      cleanupCount: record.cleanupCount,
+      errorCount: record.errorCount,
+      adapter: runtime ? 'svelte-5-dev-internals' : 'unavailable',
+      captureGap: hadCaptureGap,
+      triggers,
+      dependencies: overlapped ? [] : record.dependencies,
+      directDependencyCount: overlapped ? 0 : record.directDependencyCount,
+      dependencyTruncated: overlapped || record.dependencyTruncated,
+      addedDependencyIds,
+      removedDependencyIds
+    };
+    if (error !== null) detail.error = error;
+    const trace = pushTrace('effect-run', record.componentId ?? undefined, detail);
+    record.lastRunId = trace?.id ?? null;
+    record.recentRuns.push({
+      runCount: runIndex,
+      phase,
+      at: runAt,
+      syncDurationMs: duration,
+      outcome: error === null ? 'ok' : 'error',
+      reason,
+      triggerIds: triggers.flatMap((trigger) => {
+        const value = isObject(trigger) ? trigger.id : null;
+        return typeof value === 'string' ? [value] : [];
+      })
+    });
+    if (record.recentRuns.length > MAX_EFFECT_RUNS) {
+      record.recentRuns.splice(0, record.recentRuns.length - MAX_EFFECT_RUNS);
+    }
+    scheduleSnapshot();
+    emitHello();
+  }
+
+  function dependencyDetail(dependency: CapturedDependency): JsonValue {
+    const detail: Record<string, JsonValue> = {
+      id: dependency.id,
+      label: dependency.label,
+      kind: dependency.kind,
+      value: dependency.value,
+      writeVersion: dependency.writeVersion,
+      dirty: dependency.dirty,
+      depth: dependency.depth,
+      direct: dependency.direct,
+      parentId: dependency.parentId
+    };
+    if (dependency.createdAt) detail.createdAt = dependency.createdAt;
+    if (dependency.updatedAt && dependency.updatedAt.length > 0) detail.updatedAt = dependency.updatedAt;
+    return detail;
+  }
+
+  function effectSnapshotDetail(record: EffectRecord): JsonValue {
+    refreshEffectStatus(record);
+    return {
+      id: record.id,
+      siteId: record.descriptor.siteId,
+      componentId: record.componentId,
+      parentEffectId: record.parentEffectId,
+      kind: record.descriptor.kind,
+      source: { ...record.descriptor.source },
+      status: record.status,
+      adapter: record.adapterStatus,
+      runCount: record.runCount,
+      rerunCount: Math.max(0, record.runCount - 1),
+      phase: record.runCount <= 1 ? 'initial' : 'rerun',
+      outcome: record.lastOutcome,
+      capturedRunCount: record.capturedRunCount,
+      timedRunCount: record.timedRunCount,
+      cleanupCount: record.cleanupCount,
+      cleanupRegistered: record.cleanupRegistered,
+      errorCount: record.errorCount,
+      lastSyncDurationMs: record.lastSyncDurationMs,
+      maxSyncDurationMs: record.maxSyncDurationMs,
+      totalSyncDurationMs: record.totalSyncDurationMs,
+      averageSyncDurationMs: record.timedRunCount > 0
+        ? record.totalSyncDurationMs / record.timedRunCount
+        : null,
+      lastRunAt: record.lastRunAt,
+      lastRunId: record.lastRunId,
+      dependencyCount: record.dependencies.length,
+      directDependencyCount: record.directDependencyCount,
+      dependencyTruncated: record.dependencyTruncated,
+      dependencies: record.dependencies,
+      triggers: record.triggers,
+      addedDependencyIds: record.addedDependencyIds,
+      removedDependencyIds: record.removedDependencyIds,
+      captureGap: record.captureGap,
+      recentRuns: record.recentRuns,
+      lastError: record.lastError
+    };
+  }
+
+  function refreshEffectStatus(record: EffectRecord): void {
+    const effect = record.effectObject;
+    if (!effect) return;
+    const flags = readFiniteProperty(effect, 'f');
+    const fn = readDataProperty(effect, 'fn');
+    if ((flags !== null && (flags & (1 << 14)) !== 0) || fn === null) {
+      record.status = 'disposed';
+    }
+  }
+
+  function getSignalId(signal: object): string {
+    const existing = signalIds.get(signal);
+    if (existing) return existing;
+    const id = `sig:${++signalCounter}`;
+    signalIds.set(signal, id);
+    return id;
+  }
+
+  function readUpdatedStacks(value: unknown, budget: PreviewBudget): string[] {
+    if (!(value instanceof Map)) return [];
+    const stacks: string[] = [];
+    try {
+      for (const item of value.values()) {
+        const error = isObjectValue(item) ? readDataProperty(item, 'error') : null;
+        const stack = readErrorStack(error, budget);
+        if (stack) stacks.push(stack);
+        if (stacks.length >= 3) break;
+      }
+    } catch {
+      return stacks;
+    }
+    return stacks;
+  }
+
+  function readErrorStack(value: unknown, budget: PreviewBudget): string | null {
+    if (!(value instanceof Error)) return null;
+    return typeof value.stack === 'string'
+      ? previewText(value.stack, budget, 2_048)
+      : previewText(value.message, budget, 2_048);
+  }
+
+  function effectErrorDetail(error: unknown): JsonValue {
+    try {
+      if (error instanceof Error) {
+        const detail: Record<string, JsonValue> = {
+          name: truncate(error.name || 'Error', 256),
+          message: truncate(error.message || error.name, MAX_PREVIEW_STRING)
+        };
+        if (typeof error.stack === 'string') detail.stack = truncate(error.stack, 8_192);
+        return detail;
+      }
+    } catch {
+      return { name: 'Error', message: 'Error details unavailable' };
+    }
+    return { name: 'Error', message: truncate(errorMessage(error), MAX_PREVIEW_STRING) };
+  }
+
+  function jsonPreviewKey(value: JsonValue): string {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return '[unavailable]';
+    }
+  }
+
   function beginComponent(candidate: ComponentDescriptor): string | null {
     try {
       if (!isDescriptor(candidate) || components.size >= MAX_COMPONENTS) return null;
@@ -291,7 +1252,8 @@ function bootstrap(): void {
         elements: new Set(),
         bounds: new Set(),
         checkpoints: [],
-        lastPreview: new Map()
+        lastPreview: new Map(),
+        effects: new Set()
       };
       components.set(id, record);
       activeComponents.push(id);
@@ -372,11 +1334,18 @@ function bootstrap(): void {
     if (!id) return;
     const record = components.get(id);
     if (!record) return;
+    const effectIds = Array.from(record.effects);
+    // Preserve causal timeline order when an error boundary synchronously
+    // unmounts: the throwing effect receipt must precede the unmount receipt.
+    for (const effectId of effectIds) effectRecords.get(effectId)?.pendingFinalize?.(false);
     pushTrace('unmount', id, {
       lifetimeMs: Math.max(0, performance.now() - record.mountedAt),
-      updateCount: record.updateCount
+      updateCount: record.updateCount,
+      effectCount: effectIds.length
     });
+    for (const effectId of effectIds) removeEffectRecord(effectId);
     components.delete(id);
+    omittedEffectsByComponent.delete(id);
     if (timelineMode === 'live') liveBaselines.delete(id);
     if (record.invocationEntry && entryOwners.get(record.invocationEntry) === id) {
       entryParentHints.set(record.invocationEntry, record.parentId);
@@ -391,6 +1360,43 @@ function bootstrap(): void {
     if (recording) {
       scheduleReconcile();
       scheduleSnapshot();
+    }
+    emitHello();
+  }
+
+  function abortComponent(id: string | null, error?: unknown): void {
+    if (!id) return;
+    const record = components.get(id);
+    if (!record) return;
+    const effectIds = Array.from(record.effects);
+    for (const effectId of effectIds) effectRecords.get(effectId)?.pendingFinalize?.(false);
+    pushTrace('component-error', id, {
+      phase: 'initialization',
+      component: {
+        name: record.descriptor.name,
+        file: record.descriptor.file
+      },
+      error: effectErrorDetail(error)
+    });
+    for (const effectId of effectIds) removeEffectRecord(effectId);
+    components.delete(id);
+    omittedEffectsByComponent.delete(id);
+    liveBaselines.delete(id);
+    if (record.invocationEntry && entryOwners.get(record.invocationEntry) === id) {
+      entryParentHints.set(record.invocationEntry, record.parentId);
+      entryOwners.delete(record.invocationEntry);
+    }
+    const stackIndex = activeComponents.lastIndexOf(id);
+    if (stackIndex !== -1) activeComponents.splice(stackIndex, 1);
+    for (const element of record.elements) {
+      if (elementOwners.get(element) === id) elementOwners.delete(element);
+    }
+    if (selectedHighlight === id) clearHighlight();
+    if (recording) {
+      scheduleReconcile();
+      scheduleSnapshot();
+    } else if (activeComponents.length === 0) {
+      stopObserver();
     }
     emitHello();
   }
@@ -422,7 +1428,7 @@ function bootstrap(): void {
       emitHello(true);
       if (recording) emitSnapshot();
       if (!wasConnected && traceHistory.length > 0) {
-        send({ type: 'trace', payload: { events: traceHistory.slice(-MAX_TRACE_BATCH) } });
+        send({ type: 'trace', payload: { events: trailingTraceBatch(traceHistory) } });
         traceBatch.length = 0;
       }
       return;
@@ -453,8 +1459,10 @@ function bootstrap(): void {
         recording = command.enabled;
         setInteractionListeners(recording);
         if (recording) {
+          enableRuntimeTracing();
           ensureObserver(true);
           needsFullScan = true;
+          for (const effect of effectRecords.values()) resumeEffectCapture(effect);
           for (const record of components.values()) {
             const checkpoint = hasWritableState(record) ? captureCheckpoint(record, 'init') : null;
             pushTrace('mount', record.id, checkpointTraceDetail('baseline', checkpoint));
@@ -512,7 +1520,8 @@ function bootstrap(): void {
         picker: metadata || enhanced,
         trace: metadata || enhanced,
         state,
-        timeTravel
+        timeTravel,
+        effects: runtimeResolvers.length > 0 || effectRecords.size > 0
       }
     } as const;
     const signature = JSON.stringify(payload);
@@ -915,6 +1924,12 @@ function bootstrap(): void {
         state,
         writableState: writableStateDetail(record),
         derived,
+        effects: Array.from(record.effects)
+          .map((effectId) => effectRecords.get(effectId))
+          .filter((effect): effect is EffectRecord => Boolean(effect))
+          .map(effectSnapshotDetail),
+        effectTotal: record.effects.size + (omittedEffectsByComponent.get(record.id) ?? 0),
+        effectsOmitted: omittedEffectsByComponent.get(record.id) ?? 0,
         invocation: record.invocationEntry
           ? {
               file: record.invocationEntry.file,
@@ -1076,7 +2091,7 @@ function bootstrap(): void {
   function writableStateDetail(record: ComponentRecord): JsonValue {
     const result = Object.create(null) as Record<string, JsonValue>;
     for (const [name, adapter] of safeEntries(record.descriptor.state)) {
-      result[name] = typeof adapter.set === 'function';
+      result[name] = isWritableStateAdapter(adapter);
     }
     return result;
   }
@@ -1163,10 +2178,18 @@ function bootstrap(): void {
     if (recentCause && at - recentCause.at < 1_000 && kind !== 'interaction') {
       trace.causeId = recentCause.id;
     }
-    if (detail !== undefined) trace.detail = detail;
+    if (detail !== undefined) trace.detail = fitTraceDetail(detail, kind);
+    const traceJsonSize = serializedJsonLength(trace);
+    traceJsonSizes.set(trace, traceJsonSize);
     traceHistory.push(trace);
-    if (traceHistory.length > MAX_TRACE_HISTORY) {
-      traceHistory.splice(0, traceHistory.length - MAX_TRACE_HISTORY);
+    traceHistoryJsonChars += traceJsonSize;
+    while (
+      traceHistory.length > MAX_TRACE_HISTORY ||
+      traceHistoryJsonChars > MAX_TRACE_HISTORY_JSON_CHARS
+    ) {
+      const removed = traceHistory.shift();
+      if (!removed) break;
+      traceHistoryJsonChars -= traceJsonSizes.get(removed) ?? 0;
     }
     traceBatch.push(trace);
     if (traceBatch.length > MAX_TRACE_BATCH) traceBatch.shift();
@@ -1180,10 +2203,34 @@ function bootstrap(): void {
     queueMicrotask(() => {
       traceFlushQueued = false;
       if (!connected || traceBatch.length === 0) return;
-      const events = traceBatch.splice(0, MAX_TRACE_BATCH);
+      const events: TraceRecord[] = [];
+      let chars = 0;
+      while (traceBatch.length > 0 && events.length < MAX_TRACE_BATCH) {
+        const next = traceBatch[0];
+        if (!next) break;
+        const nextChars = traceJsonSizes.get(next) ?? serializedJsonLength(next);
+        if (events.length > 0 && chars + nextChars > MAX_TRACE_BATCH_JSON_CHARS) break;
+        traceBatch.shift();
+        events.push(next);
+        chars += nextChars;
+      }
       send({ type: 'trace', payload: { events } });
       if (traceBatch.length > 0) queueTraceFlush();
     });
+  }
+
+  function trailingTraceBatch(history: TraceRecord[]): TraceRecord[] {
+    const events: TraceRecord[] = [];
+    let chars = 0;
+    for (let index = history.length - 1; index >= 0 && events.length < MAX_TRACE_BATCH; index--) {
+      const trace = history[index];
+      if (!trace) continue;
+      const nextChars = traceJsonSizes.get(trace) ?? serializedJsonLength(trace);
+      if (events.length > 0 && chars + nextChars > MAX_TRACE_BATCH_JSON_CHARS) break;
+      events.push(trace);
+      chars += nextChars;
+    }
+    return events.reverse();
   }
 
   function onInteraction(event: Event): void {
@@ -1694,7 +2741,7 @@ function bootstrap(): void {
       return;
     }
     const adapter = record.descriptor.state[name];
-    if (!adapter?.set) {
+    if (!adapter || !isWritableStateAdapter(adapter)) {
       commandError(command.requestId, `State binding "${name}" is read-only or unavailable`);
       return;
     }
@@ -1951,7 +2998,7 @@ function bootstrap(): void {
     const reasons: string[] = [];
     let writable = 0;
     for (const [name, adapter] of safeEntries(record.descriptor.state)) {
-      if (!adapter.set) continue;
+      if (!isWritableStateAdapter(adapter)) continue;
       writable++;
       try {
         const current = adapter.get();
@@ -1991,7 +3038,9 @@ function bootstrap(): void {
     }> = [];
     for (const [name, value] of stored.values) {
       const adapter = record.descriptor.state[name];
-      if (!adapter?.set) return `Writable state binding "${name}" is no longer available`;
+      if (!adapter || !isWritableStateAdapter(adapter)) {
+        return `Writable state binding "${name}" is no longer available`;
+      }
       if (!value.restorable) return value.reason ?? `State binding "${name}" is not restorable`;
       const next = cloneForStorage(value.value);
       if (!next.ok) return next.reason ?? `State binding "${name}" cannot be cloned`;
@@ -2034,7 +3083,7 @@ function bootstrap(): void {
   }
 
   function hasWritableState(record: ComponentRecord): boolean {
-    return safeEntries(record.descriptor.state).some(([, adapter]) => typeof adapter.set === 'function');
+    return safeEntries(record.descriptor.state).some(([, adapter]) => isWritableStateAdapter(adapter));
   }
 
   function isOverlayEvent(event: Event): boolean {
@@ -2086,12 +3135,101 @@ function isDescriptor(value: unknown): value is ComponentDescriptor {
   );
 }
 
+function isEffectDescriptor(value: unknown): value is EffectDescriptor {
+  try {
+    if (!isObject(value) || !isObject(value.source)) return false;
+    return (
+      typeof value.siteId === 'string' &&
+      value.siteId.length > 0 &&
+      value.siteId.length <= 256 &&
+      (value.componentId === null || (typeof value.componentId === 'string' && value.componentId.length <= 256)) &&
+      (value.kind === 'effect' || value.kind === 'pre') &&
+      typeof value.source.file === 'string' &&
+      value.source.file.length <= 32_768 &&
+      Number.isInteger(value.source.line) &&
+      (value.source.line as number) >= 0 &&
+      Number.isInteger(value.source.column) &&
+      (value.source.column as number) >= 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+function copyEffectDescriptor(value: EffectDescriptor): EffectDescriptor {
+  return {
+    siteId: value.siteId,
+    componentId: value.componentId,
+    kind: value.kind,
+    source: copySource(value.source)
+  };
+}
+
+function isEffectRuntimeAdapter(value: unknown): value is EffectRuntimeAdapter {
+  return (
+    isObject(value) &&
+    typeof value.untrack === 'function' &&
+    (value.enableTracing === undefined || typeof value.enableTracing === 'function')
+  );
+}
+
+function isEffectObject(value: unknown): value is object {
+  if (!isObjectValue(value)) return false;
+  const deps = readDataProperty(value, 'deps');
+  return (
+    (deps === null || Array.isArray(deps)) &&
+    readFiniteProperty(value, 'wv') !== null &&
+    readFiniteProperty(value, 'f') !== null
+  );
+}
+
+function isObjectValue(value: unknown): value is object {
+  return typeof value === 'object' && value !== null;
+}
+
+function readDataProperty(value: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readFiniteProperty(value: object, key: string): number | null {
+  const item = readDataProperty(value, key);
+  return typeof item === 'number' && Number.isFinite(item) ? item : null;
+}
+
+function readObjectProperty(value: object, key: string): object | null {
+  const item = readDataProperty(value, key);
+  return isObjectValue(item) ? item : null;
+}
+
+function readBoundedArrayProperty(
+  value: object,
+  key: string,
+  limit: number
+): BoundedObjectArray | null {
+  const item = readDataProperty(value, key);
+  if (item === null) return null;
+  if (!Array.isArray(item)) return null;
+  const values: object[] = [];
+  const readLimit = Math.min(item.length, Math.max(0, limit));
+  for (let index = 0; index < readLimit; index++) {
+    const entry = item[index];
+    if (isObjectValue(entry)) values.push(entry);
+  }
+  return { values, length: item.length, truncated: item.length > readLimit };
+}
+
 function isAdapterRecord(value: unknown, writable: boolean): boolean {
   if (!isObject(value)) return false;
   try {
     for (const adapter of Object.values(value)) {
       if (!isObject(adapter) || typeof adapter.get !== 'function') return false;
       if (writable && adapter.set !== undefined && typeof adapter.set !== 'function') return false;
+      if (writable && adapter.canSet !== undefined && typeof adapter.canSet !== 'function') return false;
     }
     return true;
   } catch {
@@ -2234,6 +3372,47 @@ function compactSnapshotNode(node: SnapshotNode): SnapshotNode {
     );
   }
   if (isObject(detail.timeline)) compactDetail.timeline = compactPlainJson(detail.timeline, 16);
+  if (Array.isArray(detail.effects)) {
+    const compactEffects = detail.effects.slice(0, 100).map((effect) => {
+      if (!isObject(effect)) return null;
+      const compactEffect = compactPlainJson(effect, 32);
+      if (isObject(compactEffect)) {
+        if (isObject(effect.source)) {
+          const source: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
+          if (typeof effect.source.file === 'string') source.file = truncate(effect.source.file, 4_096);
+          if (typeof effect.source.line === 'number' && Number.isFinite(effect.source.line)) {
+            source.line = effect.source.line;
+          }
+          if (typeof effect.source.column === 'number' && Number.isFinite(effect.source.column)) {
+            source.column = effect.source.column;
+          }
+          compactEffect.source = source;
+        }
+        if (effect.lastError !== undefined) {
+          compactEffect.lastError = compactTraceJson(effect.lastError, 0, {
+            nodes: 256,
+            chars: 16_000,
+            seen: new WeakSet()
+          });
+        }
+        compactEffect.dependencies = [];
+        compactEffect.triggers = [];
+        compactEffect.dependencyTruncated = true;
+        compactEffect.triggerDetailOmitted = true;
+        compactEffect.captureGap = true;
+        compactEffect.recentRuns = Array.isArray(effect.recentRuns)
+          ? effect.recentRuns.slice(-5).map((run) => isObject(run) ? compactPlainJson(run, 16) : null)
+          : [];
+      }
+      return compactEffect;
+    });
+    compactDetail.effects = compactEffects;
+    const reportedTotal = typeof detail.effectTotal === 'number' && Number.isFinite(detail.effectTotal)
+      ? Math.max(0, Math.floor(detail.effectTotal))
+      : detail.effects.length;
+    compactDetail.effectTotal = reportedTotal;
+    compactDetail.effectsOmitted = Math.max(0, reportedTotal - compactEffects.length);
+  }
   if (Array.isArray(detail.rects)) compactDetail.rects = detail.rects.slice(0, 16);
 
   const compact: SnapshotNode = {
@@ -2337,6 +3516,191 @@ function measureJson(value: unknown): { valid: boolean; nodes: number; chars: nu
   return { valid, nodes, chars };
 }
 
+interface TraceJsonBudget {
+  nodes: number;
+  chars: number;
+  seen: WeakSet<object>;
+}
+
+function fitTraceDetail(detail: JsonValue, kind?: string): JsonValue {
+  const metrics = measureJson(detail);
+  if (
+    metrics.valid &&
+    metrics.nodes <= MAX_TRACE_DETAIL_JSON_NODES &&
+    metrics.chars <= MAX_TRACE_DETAIL_JSON_CHARS
+  ) {
+    return detail;
+  }
+
+  if (kind === 'effect-run' && isObject(detail)) {
+    return compactEffectRunTraceDetail(detail, metrics);
+  }
+
+  const compact = compactTraceJson(detail, 0, {
+    nodes: MAX_TRACE_DETAIL_JSON_NODES,
+    chars: MAX_TRACE_DETAIL_JSON_CHARS,
+    seen: new WeakSet()
+  });
+  const compactMetrics = measureJson(compact);
+  if (
+    compactMetrics.valid &&
+    compactMetrics.nodes <= MAX_TRACE_DETAIL_JSON_NODES &&
+    compactMetrics.chars <= MAX_TRACE_DETAIL_JSON_CHARS
+  ) {
+    return compact;
+  }
+  return {
+    $type: 'truncated',
+    reason: 'trace-detail-budget',
+    originalNodes: metrics.nodes,
+    originalChars: metrics.chars
+  };
+}
+
+function compactEffectRunTraceDetail(
+  detail: Record<string, unknown>,
+  originalMetrics: { valid: boolean; nodes: number; chars: number }
+): JsonValue {
+  const compact: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
+  const scalarKeys = [
+    'effectId',
+    'siteId',
+    'kind',
+    'parentEffectId',
+    'runCount',
+    'rerunCount',
+    'capturedRunCount',
+    'timedRunCount',
+    'phase',
+    'reason',
+    'syncDurationMs',
+    'outcome',
+    'cleanupRegistered',
+    'cleanupCount',
+    'errorCount',
+    'adapter',
+    'captureGap',
+    'directDependencyCount'
+  ];
+  for (const key of scalarKeys) {
+    const value = detail[key];
+    if (
+      value === null ||
+      typeof value === 'string' ||
+      typeof value === 'boolean' ||
+      (typeof value === 'number' && Number.isFinite(value))
+    ) {
+      compact[key] = typeof value === 'string' ? truncate(value, 4_096) : value;
+    }
+  }
+  if (isObject(detail.source)) {
+    const source: Record<string, JsonValue> = Object.create(null) as Record<string, JsonValue>;
+    if (typeof detail.source.file === 'string') source.file = truncate(detail.source.file, 4_096);
+    if (typeof detail.source.line === 'number' && Number.isFinite(detail.source.line)) {
+      source.line = detail.source.line;
+    }
+    if (typeof detail.source.column === 'number' && Number.isFinite(detail.source.column)) {
+      source.column = detail.source.column;
+    }
+    compact.source = source;
+  }
+  if (detail.error !== undefined) {
+    compact.error = compactTraceJson(detail.error, 0, {
+      nodes: 256,
+      chars: 16_000,
+      seen: new WeakSet()
+    });
+  }
+  compact.dependencyCount = Array.isArray(detail.dependencies) ? detail.dependencies.length : 0;
+  compact.omittedTriggerCount = Array.isArray(detail.triggers) ? detail.triggers.length : 0;
+  compact.dependencies = [];
+  compact.triggers = [];
+  compact.addedDependencyIds = [];
+  compact.removedDependencyIds = [];
+  compact.dependencyTruncated = true;
+  compact.triggerDetailOmitted = true;
+  compact.originalNodes = originalMetrics.nodes;
+  compact.originalChars = originalMetrics.chars;
+
+  const compactMetrics = measureJson(compact);
+  if (
+    compactMetrics.valid &&
+    compactMetrics.nodes <= MAX_TRACE_DETAIL_JSON_NODES &&
+    compactMetrics.chars <= MAX_TRACE_DETAIL_JSON_CHARS
+  ) {
+    return compact;
+  }
+  return {
+    effectId: typeof detail.effectId === 'string' ? truncate(detail.effectId, 4_096) : 'unknown',
+    kind: typeof detail.kind === 'string' ? truncate(detail.kind, 64) : 'effect',
+    outcome: detail.outcome === 'error' ? 'error' : 'ok',
+    dependencies: [],
+    triggers: [],
+    addedDependencyIds: [],
+    removedDependencyIds: [],
+    dependencyTruncated: true,
+    triggerDetailOmitted: true,
+    captureGap: true,
+    reason: 'trace-detail-budget'
+  };
+}
+
+function compactTraceJson(value: unknown, depth: number, budget: TraceJsonBudget): JsonValue {
+  if (budget.nodes-- <= 0 || budget.chars <= 0 || depth > 16) {
+    return { $type: 'truncated', reason: 'trace-detail-budget' };
+  }
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : { $type: 'number', value: String(value) };
+  }
+  if (typeof value === 'string') {
+    const result = truncate(value, Math.min(4_096, Math.max(0, budget.chars)));
+    budget.chars -= result.length;
+    return result;
+  }
+  if (typeof value !== 'object') return { $type: 'unavailable' };
+  if (budget.seen.has(value)) return { $type: 'circular' };
+  budget.seen.add(value);
+
+  if (Array.isArray(value)) {
+    const output: JsonValue[] = [];
+    const limit = Math.min(value.length, 256);
+    for (let index = 0; index < limit; index++) {
+      if (budget.nodes <= 0 || budget.chars <= 0) break;
+      output.push(compactTraceJson(value[index], depth + 1, budget));
+    }
+    if (output.length < value.length) {
+      output.push({ $type: 'truncated', remaining: value.length - output.length });
+    }
+    return output;
+  }
+
+  const output = Object.create(null) as Record<string, JsonValue>;
+  const keys = Object.keys(value);
+  const limit = Math.min(keys.length, 128);
+  for (let index = 0; index < limit; index++) {
+    if (budget.nodes <= 0 || budget.chars <= 0) break;
+    const key = keys[index];
+    if (key === undefined) continue;
+    const safeKey = truncate(key, Math.min(512, Math.max(0, budget.chars)));
+    if (!safeKey) break;
+    budget.chars -= safeKey.length;
+    output[safeKey] = compactTraceJson((value as Record<string, unknown>)[key], depth + 1, budget);
+  }
+  if (Object.keys(output).length < keys.length) {
+    output.$truncated = { $type: 'truncated', reason: 'trace-detail-budget' };
+  }
+  return output;
+}
+
+function serializedJsonLength(value: unknown): number {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return MAX_TRACE_DETAIL_JSON_CHARS;
+  }
+}
+
 function connectedElements(elements: Iterable<Element>): Element[] {
   const result: Element[] = [];
   for (const element of elements) {
@@ -2348,27 +3712,34 @@ function connectedElements(elements: Iterable<Element>): Element[] {
 function preview(value: unknown): JsonValue {
   return previewInner(value, 0, {
     nodes: 2_000,
+    chars: 250_000,
     seen: new Map(),
     nextRef: 1
   });
 }
 
+function effectPreview(value: unknown, budget: PreviewBudget): JsonValue {
+  return previewInner(value, 0, budget);
+}
+
 function previewInner(value: unknown, depth: number, budget: PreviewBudget): JsonValue {
-  if (budget.nodes-- <= 0) return { $type: 'truncated', reason: 'node-budget' };
+  if (budget.nodes-- <= 0 || budget.chars <= 0) {
+    return { $type: 'truncated', reason: budget.nodes <= 0 ? 'node-budget' : 'char-budget' };
+  }
   if (value === null || typeof value === 'boolean' || typeof value === 'string') {
-    return typeof value === 'string' ? truncate(value, MAX_PREVIEW_STRING) : value;
+    return typeof value === 'string' ? previewText(value, budget) : value;
   }
   if (typeof value === 'number') {
     return Number.isFinite(value) ? value : { $type: 'number', value: String(value) };
   }
   if (typeof value === 'undefined') return { $type: 'undefined' };
-  if (typeof value === 'bigint') return { $type: 'bigint', value: String(value) };
-  if (typeof value === 'symbol') return { $type: 'symbol', value: value.description ?? '' };
+  if (typeof value === 'bigint') return { $type: 'bigint', value: previewText(String(value), budget) };
+  if (typeof value === 'symbol') return { $type: 'symbol', value: previewText(value.description ?? '', budget) };
   if (typeof value === 'function') {
-    return { $type: 'function', name: value.name || 'anonymous' };
+    return { $type: 'function', name: previewText(value.name || 'anonymous', budget, 512) };
   }
   if (depth >= MAX_PREVIEW_DEPTH) {
-    return { $type: 'truncated', reason: 'depth', tag: objectTag(value) };
+    return { $type: 'truncated', reason: 'depth', tag: previewText(objectTag(value), budget, 256) };
   }
 
   const existingRef = budget.seen.get(value);
@@ -2381,18 +3752,21 @@ function previewInner(value: unknown, depth: number, budget: PreviewBudget): Jso
       return {
         $type: 'element',
         tag: value.tagName.toLowerCase(),
-        id: value.id || null
+        id: value.id ? previewText(value.id, budget, 512) : null
       };
     }
     if (value instanceof Date) {
-      return { $type: 'date', value: Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString() };
+      return {
+        $type: 'date',
+        value: previewText(Number.isNaN(value.getTime()) ? 'Invalid Date' : value.toISOString(), budget, 128)
+      };
     }
-    if (value instanceof RegExp) return { $type: 'regexp', value: String(value) };
+    if (value instanceof RegExp) return { $type: 'regexp', value: previewText(String(value), budget) };
     if (value instanceof Error) {
       return {
         $type: 'error',
-        name: value.name,
-        message: truncate(value.message, MAX_PREVIEW_STRING)
+        name: previewText(value.name, budget, 256),
+        message: previewText(value.message, budget)
       };
     }
     if (Array.isArray(value)) {
@@ -2451,6 +3825,11 @@ function previewInner(value: unknown, depth: number, budget: PreviewBudget): Jso
         output.$truncated = { $type: 'truncated', reason: 'item-budget' };
         break;
       }
+      if (key.length > Math.min(512, budget.chars)) {
+        output.$truncated = { $type: 'truncated', reason: 'char-budget' };
+        break;
+      }
+      budget.chars -= key.length;
       try {
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
         if (!descriptor) {
@@ -2461,13 +3840,19 @@ function previewInner(value: unknown, depth: number, budget: PreviewBudget): Jso
           output[key] = accessorPreview(descriptor);
         }
       } catch (error) {
-        output[key] = errorPreview(error);
+        output[key] = { $type: 'error', message: previewText(errorMessage(error), budget) };
       }
     }
     return output;
   } catch (error) {
-    return errorPreview(error);
+    return { $type: 'error', message: previewText(errorMessage(error), budget) };
   }
+}
+
+function previewText(value: string, budget: PreviewBudget, limit = MAX_PREVIEW_STRING): string {
+  const result = truncate(value, Math.min(limit, Math.max(0, budget.chars)));
+  budget.chars -= result.length;
+  return result;
 }
 
 function cloneForStorage(value: unknown): CloneResult {
