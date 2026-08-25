@@ -55,9 +55,13 @@ Open the printed local URL, then use the Svelte Lens panel. The fixture includes
 
 Add the plugin before or alongside the regular Svelte/SvelteKit Vite plugin. Its two transforms use `enforce: 'pre'` and `enforce: 'post'`, so array position is not significant.
 
+```bash
+pnpm add -D svelte-lens-vite
+```
+
 ```ts
 // vite.config.ts
-import { svelteLens } from '@svelte-lens/vite-plugin';
+import { svelteLens } from 'svelte-lens-vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vite';
 
@@ -69,7 +73,7 @@ export default defineConfig({
 For SvelteKit:
 
 ```ts
-import { svelteLens } from '@svelte-lens/vite-plugin';
+import { svelteLens } from 'svelte-lens-vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
@@ -95,6 +99,8 @@ pnpm build             # plugin, extension, and playground builds
 pnpm build:extension   # unpacked Chrome artifact only
 ```
 
+Tagged releases run `.github/workflows/release.yml`: they repeat the full validation, upload a versioned Chrome extension ZIP and npm tarball, then publish `svelte-lens-vite` through npm trusted publishing. See [docs/RELEASING.md](docs/RELEASING.md) for the version/tag contract.
+
 ## Current boundaries
 
 - Chrome 116+ and the top frame only.
@@ -111,8 +117,8 @@ pnpm build:extension   # unpacked Chrome artifact only
 
 ```text
 apps/extension/       MV3 extension, page hook, bridge, and Svelte panel
-packages/vite-plugin Optional Svelte/Vite instrumentation
-examples/playground  Svelte 5 manual and integration fixture
+packages/vite-plugin  Published as svelte-lens-vite
+examples/playground   Svelte 5 manual and integration fixture
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data flow and stability boundary.

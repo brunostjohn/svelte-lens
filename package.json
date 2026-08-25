@@ -5,10 +5,10 @@
   "type": "module",
   "packageManager": "pnpm@10.29.3",
   "scripts": {
-    "build": "pnpm --filter @svelte-lens/vite-plugin build && pnpm --filter @svelte-lens/extension build && pnpm --filter @svelte-lens/playground build",
+    "build": "pnpm --filter svelte-lens-vite build && pnpm --filter @svelte-lens/extension build && pnpm --filter @svelte-lens/playground build",
     "build:extension": "pnpm --filter @svelte-lens/extension build",
-    "check": "pnpm --filter @svelte-lens/vite-plugin build && pnpm -r check",
-    "dev": "pnpm --filter @svelte-lens/vite-plugin build && pnpm --filter @svelte-lens/playground dev",
+    "check": "pnpm --filter svelte-lens-vite build && pnpm -r check",
+    "dev": "pnpm --filter svelte-lens-vite build && pnpm --filter @svelte-lens/playground dev",
     "test": "vitest run"
   },
   "devDependencies": {

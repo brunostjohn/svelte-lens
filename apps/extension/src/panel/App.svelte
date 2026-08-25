@@ -622,7 +622,7 @@
                 </div>
               {:else}
                 <div class="section-empty">
-                  {selectedDetail?.enhanced === true ? `No ${section} captured` : 'Add @svelte-lens/vite-plugin for live values'}
+                  {selectedDetail?.enhanced === true ? `No ${section} captured` : 'Add svelte-lens-vite for live values'}
                 </div>
               {/if}
             </section>

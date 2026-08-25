@@ -9,7 +9,7 @@
     "dev": "vite --host 127.0.0.1"
   },
   "dependencies": {
-    "@svelte-lens/vite-plugin": "workspace:*",
+    "svelte-lens-vite": "workspace:*",
     "svelte": "^5.56.9"
   },
   "devDependencies": {

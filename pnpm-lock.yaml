@@ -45,12 +45,12 @@ importers:
 
   examples/playground:
     dependencies:
-      '@svelte-lens/vite-plugin':
-        specifier: workspace:*
-        version: link:../../packages/vite-plugin
       svelte:
         specifier: ^5.56.9
         version: 5.56.9
+      svelte-lens-vite:
+        specifier: workspace:*
+        version: link:../../packages/vite-plugin
     devDependencies:
       '@sveltejs/vite-plugin-svelte':
         specifier: ^6.2.0
@@ -70,10 +70,10 @@ importers:
       magic-string:
         specifier: ^0.30.17
         version: 0.30.21
+    devDependencies:
       svelte:
         specifier: ^5.56.9
         version: 5.56.9
-    devDependencies:
       vite:
         specifier: ^7.3.2
         version: 7.3.6(@types/node@24.13.3)
