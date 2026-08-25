@@ -56,4 +56,30 @@ describe('ReplayBuffer', () => {
     expect(replay.frames).toEqual([]);
     expect(replay.gap).toMatchObject({ fromSeq: 1, toSeq: 2 });
   });
+
+  it('evicts the oldest frames by serialized bytes as well as count', () => {
+    const buffer = new ReplayBuffer(100, 700);
+    const large: PageEvent = {
+      type: 'command-result',
+      payload: { requestId: 'large', ok: true, data: 'x'.repeat(180) }
+    };
+
+    buffer.append('doc-a', large);
+    buffer.append('doc-a', large);
+
+    const replay = buffer.replay('doc-a', 0);
+    expect(buffer.bytes).toBeLessThanOrEqual(700);
+    expect(replay.gap).toMatchObject({ fromSeq: 1, toSeq: 1 });
+    expect(replay.frames.map((frame) => frame.seq)).toEqual([2]);
+  });
+
+  it('does not retain a single frame larger than the byte budget', () => {
+    const buffer = new ReplayBuffer(100, 64);
+    const frame = buffer.append('doc-a', hello);
+
+    expect(frame.seq).toBe(1);
+    expect(buffer.size).toBe(0);
+    expect(buffer.bytes).toBe(0);
+    expect(buffer.replay('doc-a', 0).gap).toMatchObject({ fromSeq: 1, toSeq: 1 });
+  });
 });

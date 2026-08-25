@@ -22,7 +22,7 @@ Inspired by [React Lens](https://github.com/Fausto95/react-lens), with a Svelte-
 
 The base extension does not patch Svelte's private runtime. Svelte currently exposes development DOM/source ancestry, but no stable global Svelte 5 lifecycle/state hook. Enhanced state features therefore use an explicit Vite transform instead of silently depending on a brittle runtime monkey patch.
 
-Lens capture sleeps by default. The page hook keeps only lightweight enhanced-component identity and effect counters while the panel is closed; mutation tracing, dependency previews, effect receipts, checkpoints, state previews, and automatic snapshots start when the Svelte Lens panel is visible and stop again when it is hidden or disconnected. The first detailed effect-capture session dynamically enables Svelte's development write-stack tracing. Svelte does not expose a way to turn that flag back off, so its own write-stack bookkeeping remains enabled until the inspected page reloads even though Lens stops observing, serializing, and retaining data when the panel closes.
+Lens capture sleeps by default. The page hook keeps only lightweight enhanced-component identity and effect counters while the panel is closed; mutation tracing, dependency previews, effect receipts, checkpoints, state previews, and automatic snapshots start when the Svelte Lens panel is visible and stop again when it is hidden or disconnected. Lens never enables Svelte's irreversible development write-stack tracing flag. Why-rerun evidence uses bounded dependency identity, version, and preview capture without adding an Error stack to every state write.
 
 ## Build and load the extension
 
@@ -54,7 +54,7 @@ Open the printed local URL, then use the Svelte Lens panel. The fixture includes
 
 ## Enable live state and rewind
 
-Add the plugin before or alongside the regular Svelte/SvelteKit Vite plugin. Its two transforms use `enforce: 'pre'` and `enforce: 'post'`, so array position is not significant.
+Add the plugin before or alongside the regular Svelte/SvelteKit Vite plugin. Its three coordinated passes run before source compilation, after component compilation, and after rune-module compilation, so array position is not significant.
 
 ```bash
 pnpm add -D svelte-lens-vite
@@ -90,6 +90,7 @@ The enhancer runs only in Vite's development server by default and does not modi
 - top-level `$derived(...)` and `$derived.by(...)` bindings;
 - a component-scoped compiled `$.inspect(...)` update callback;
 - explicit user `$effect(...)` and `$effect.pre(...)` callbacks preserved through compilation, including nested user effects;
+- named classes from `.svelte.js` and `.svelte.ts`, with lazy source-mapped inspection of compiler-known public/private `$state` and `$derived` fields;
 - public `onDestroy` cleanup, an initialization-abort guard, and the AST-identified component `$.pop(...)` boundary.
 
 ## Commands
@@ -112,13 +113,14 @@ Tagged releases run `.github/workflows/release.yml`: they repeat the full valida
 - Effect graph capture targets Svelte 5.39 or newer development output. It uses feature-guarded private dev-runtime shapes; an unsupported or changed shape degrades to unavailable dependency detail instead of throwing into the app.
 - Effect dependencies are synchronous only, matching Svelte's own tracking: reads after an `await`, timer, or other asynchronous boundary are not attributed to the run.
 - The dependency list is the actual dynamic set from the most recently captured run, not a union across history. Conditional branches therefore report added and removed dependency IDs.
-- Enhancer instrumentation currently applies to `.svelte` components only. Rune code in `.svelte.ts` and `.svelte.js` modules is outside the transform.
+- Effect and component lifecycle wrapping applies to `.svelte` components. Named rune-bearing classes in `.svelte.ts` and `.svelte.js` are also instrumented for lazy object inspection; anonymous classes and arbitrary prototype/accessor discovery remain outside the transform.
 - Run, rerun, cleanup, and error counters continue while recording is paused, but per-run receipts are not retained; `runCount - capturedRunCount` exposes paused or synchronously overlapped runs without complete evidence. On resume Lens samples the current graph as a new baseline, so later `before` values start there, but it cannot reconstruct which dependency changes caused the skipped runs.
 - Cleanup reads are timed and counted but do not become dependencies of the next effect run. `$effect.root` itself is not a tracked user-effect receipt; explicit `$effect`/`$effect.pre` callbacks created inside it are recorded independently when Svelte exposes their parent reaction.
 - Dependency graphs retain at most 60 nodes per run, with direct-count and truncation metadata preserved. Lens tracks at most 200 effects per component and 1,000 per page; the panel reports omitted counts rather than presenting a partial list as complete. Oversized wire payloads retain effect identity, source, outcome, counts, errors, and explicit omission flags while dropping bulky previews/stacks.
 - Map-safe post-compile instrumentation still covers components handled by custom Svelte preprocessors, but props/state/derived binding inspection degrades when the raw preprocessed syntax cannot be analyzed.
 - Direct proxy `$state` objects and arrays are restored in place so existing Svelte subscribers remain live. Compiler-optimized direct primitives and `$state.raw` values, plus direct `Date`, `Map`, `Set`, custom-class, and null-prototype values, are exposed as read-only when Svelte has emitted no signal or an identity-preserving replacement cannot be guaranteed.
 - Rewind applies an exact retained component checkpoint. Derived values, props, external stores, DOM-only changes, refs, and already-unmounted instances are not restored; setter application is best-effort transactional and reports rollback failures.
+- Checkpoint history is a bounded cache, never an archive: Lens keeps at most 12 per component and 256 per page under a shared 16 MiB / 100,000-node ceiling, evicting the oldest first. A single checkpoint is capped at 512 KiB, 2,000 entries, and 2,000 retained nodes.
 - Pausing, hiding, unloading, or disconnecting the panel automatically attempts to return the inspected app to its live state.
 - Values cross Chrome messaging only after bounded, JSON-safe serialization. Unsupported values are described or truncated rather than retained as live objects.
 - The component tree is inferred from Svelte's dev stack. The enhancer improves repeated-instance and root identity, but DOM-less components can still have limited page highlighting.

@@ -31,10 +31,35 @@ export interface SvelteLensEffectDescriptor {
   };
 }
 
+export type SvelteLensRuneFieldKind = "state" | "derived";
+
+export interface SvelteLensRuneFieldAdapter {
+  kind: SvelteLensRuneFieldKind;
+  source: {
+    file: string;
+    line: number;
+    column: number;
+  };
+  /** Reads a compiler-known rune signal from the supplied instance. */
+  get: (target: object) => unknown;
+}
+
+export interface SvelteLensRuneObjectDescriptor {
+  name: string;
+  file: string;
+  source: {
+    file: string;
+    line: number;
+    column: number;
+  };
+  fields: Record<string, SvelteLensRuneFieldAdapter>;
+  totalFields: number;
+  truncated: boolean;
+}
+
 export interface SvelteLensRuntimeAdapter {
   activeEffect: unknown;
   untrack: <Value>(read: () => Value) => Value;
-  enableTracing?: () => unknown;
 }
 
 export type SvelteLensRuntimeResolver = () => SvelteLensRuntimeAdapter | null;
@@ -52,6 +77,10 @@ export interface SvelteLensPageApi {
     descriptor: SvelteLensEffectDescriptor,
     callback: Callback,
   ) => Callback;
+  registerRuneObject: (
+    target: object,
+    descriptor: SvelteLensRuneObjectDescriptor,
+  ) => string | null;
 }
 
 export interface SvelteLensOptions {

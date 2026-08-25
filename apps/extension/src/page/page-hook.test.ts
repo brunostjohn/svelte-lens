@@ -33,6 +33,63 @@ describe('MAIN-world page hook', () => {
     const hook = globalThis.__SVELTE_LENS__;
     expect(hook).toBeDefined();
 
+    let runeReads = 0;
+    const runeTarget = Object.create(null) as { count?: number };
+    runeTarget.count = 7;
+    const runeId = hook?.registerRuneObject(runeTarget, {
+      name: 'RuneModel',
+      file: 'src/model.svelte.ts',
+      source: { file: 'src/model.svelte.ts', line: 1, column: 7 },
+      fields: {
+        count: {
+          kind: 'state',
+          source: { file: 'src/model.svelte.ts', line: 2, column: 2 },
+          get: (target) => {
+            runeReads++;
+            return (target as { count: number }).count;
+          }
+        }
+      },
+      totalFields: 1,
+      truncated: false
+    });
+    expect(runeId).toMatch(/^rune:/);
+    expect(runeReads).toBe(0);
+
+    dispatch(contentMessage(null, { kind: 'snapshot', requestId: 'rune-summary' }));
+    await settle();
+    const runeSummary = received.findLast(
+      (event): event is Extract<PageEvent, { type: 'snapshot' }> =>
+        event.type === 'snapshot' && event.payload.requestId === 'rune-summary'
+    );
+    expect(runeSummary?.payload.runeObjects).toEqual([
+      expect.objectContaining({
+        id: runeId,
+        name: 'RuneModel',
+        fields: [expect.objectContaining({ name: 'count', kind: 'state' })]
+      })
+    ]);
+    expect(runeReads).toBe(0);
+
+    dispatch(contentMessage(null, {
+      kind: 'inspect-rune-object',
+      requestId: 'inspect-rune',
+      objectId: runeId ?? ''
+    }));
+    await settle();
+    const runeInspection = received.findLast(
+      (event): event is Extract<PageEvent, { type: 'command-result' }> =>
+        event.type === 'command-result' && event.payload.requestId === 'inspect-rune'
+    );
+    expect(runeInspection?.payload).toMatchObject({
+      ok: true,
+      data: {
+        id: runeId,
+        fields: { count: { kind: 'state', value: 7 } }
+      }
+    });
+    expect(runeReads).toBe(1);
+
     const proxyWrites: string[] = [];
     const proxyDeletes: string[] = [];
     const proxyTarget = new Proxy({ keep: 1, remove: 2 } as Record<string, number>, {
@@ -62,6 +119,7 @@ describe('MAIN-world page hook', () => {
     expect(() => hook?.replaceStateInPlace(proxyTarget, unsafeReplacement)).toThrow('not safe');
     expect(proxyTarget).toEqual({ keep: 3, added: 4 });
 
+    const idleObserve = vi.spyOn(window.MutationObserver.prototype, 'observe');
     const idleId = hook?.beginComponent({
       name: 'IdleUnmount',
       file: 'src/IdleUnmount.svelte',
@@ -70,6 +128,8 @@ describe('MAIN-world page hook', () => {
       derived: {}
     });
     hook?.endComponent(idleId ?? null);
+    expect(idleObserve).not.toHaveBeenCalled();
+    idleObserve.mockRestore();
     const queryAll = vi.spyOn(document, 'querySelectorAll');
     hook?.unregisterComponent(idleId ?? null);
     await Promise.resolve();
@@ -232,8 +292,12 @@ describe('MAIN-world page hook', () => {
       return read();
     };
     const enableTracing = vi.fn();
-    hook?.installRuntime(() => ({ activeEffect, untrack, enableTracing }));
-    expect(enableTracing).toHaveBeenCalledTimes(1);
+    const resolveRuntime = vi.fn(() => ({ activeEffect, untrack, enableTracing }));
+    hook?.installRuntime(resolveRuntime);
+    // Svelte's tracing flag is irreversible and captures Error stacks on every
+    // subsequent state write. Lens keeps dependency/version capture on without
+    // ever enabling that global mode automatically.
+    expect(enableTracing).not.toHaveBeenCalled();
     const countSignal = {
       f: 0,
       v: 1,
@@ -330,8 +394,10 @@ describe('MAIN-world page hook', () => {
     countSignal.v = 3;
     countSignal.wv = 3;
     activeEffect = reaction;
+    const resolverCallsBeforePausedRun = resolveRuntime.mock.calls.length;
     wrapped?.();
     activeEffect = null;
+    expect(resolveRuntime).toHaveBeenCalledTimes(resolverCallsBeforePausedRun);
     reaction.wv = 3;
     await settle();
     dispatch(contentMessage(null, { kind: 'record', enabled: true }));
@@ -1074,6 +1140,204 @@ describe('MAIN-world page hook', () => {
     );
     expect(rollbackResult?.payload).toMatchObject({ ok: false, applied: 0 });
 
+    const sparseState = new Array<unknown>(100_001);
+    sparseState[100_000] = 'tail';
+    const sparseId = hook?.beginComponent({
+      name: 'SparseCheckpoint',
+      file: 'src/SparseCheckpoint.svelte',
+      props: () => ({}),
+      state: { sparseState: { get: () => sparseState, set: () => undefined } },
+      derived: {}
+    });
+    hook?.updateComponent(sparseId ?? null, 'init');
+    hook?.endComponent(sparseId ?? null);
+    await settle();
+    const sparseCheckpoint = checkpointFor(sparseId ?? '');
+    dispatch(contentMessage(null, {
+      kind: 'time-travel',
+      requestId: 'sparse-checkpoint-rejected',
+      action: 'apply',
+      targets: [{ componentId: sparseId ?? '', checkpointId: sparseCheckpoint ?? '' }]
+    }));
+    await settle();
+    const sparseResult = received.findLast(
+      (event): event is Extract<PageEvent, { type: 'time-travel-result' }> =>
+        event.type === 'time-travel-result' && event.payload.requestId === 'sparse-checkpoint-rejected'
+    );
+    expect(sparseResult?.payload.failures?.some((failure) =>
+      failure.reason.includes('Array length exceeds the checkpoint limit')
+    )).toBe(true);
+
+    const largeBackingBuffer = new ArrayBuffer(2 * 1024 * 1024);
+    const narrowView = new DataView(largeBackingBuffer, 1_024, 4);
+    narrowView.setUint32(0, 0x51e17e, true);
+    let restoredNarrowView: unknown = null;
+    const dataViewId = hook?.beginComponent({
+      name: 'DataViewCheckpoint',
+      file: 'src/DataViewCheckpoint.svelte',
+      props: () => ({}),
+      state: {
+        narrowView: {
+          get: () => narrowView,
+          set: (value) => { restoredNarrowView = value; }
+        }
+      },
+      derived: {}
+    });
+    hook?.updateComponent(dataViewId ?? null, 'init');
+    hook?.endComponent(dataViewId ?? null);
+    await settle();
+    const dataViewCheckpoint = checkpointFor(dataViewId ?? '');
+    dispatch(contentMessage(null, {
+      kind: 'time-travel',
+      requestId: 'bounded-dataview-copy',
+      action: 'apply',
+      targets: [{ componentId: dataViewId ?? '', checkpointId: dataViewCheckpoint ?? '' }]
+    }));
+    await settle();
+    expect(restoredNarrowView).toBeInstanceOf(DataView);
+    const restoredDataView = restoredNarrowView as DataView;
+    expect(restoredDataView.buffer.byteLength).toBe(4);
+    expect(restoredDataView.byteOffset).toBe(0);
+    expect(restoredDataView.getUint32(0, true)).toBe(0x51e17e);
+    dispatch(contentMessage(null, {
+      kind: 'time-travel',
+      requestId: 'bounded-dataview-live',
+      action: 'live'
+    }));
+
+    const oversizedBinary = new Uint8Array(256 * 1024 + 1);
+    const binaryId = hook?.beginComponent({
+      name: 'BinaryCheckpoint',
+      file: 'src/BinaryCheckpoint.svelte',
+      props: () => ({}),
+      state: { oversizedBinary: { get: () => oversizedBinary, set: () => undefined } },
+      derived: {}
+    });
+    hook?.updateComponent(binaryId ?? null, 'init');
+    hook?.endComponent(binaryId ?? null);
+    await settle();
+    const binaryCheckpoint = checkpointFor(binaryId ?? '');
+    dispatch(contentMessage(null, {
+      kind: 'time-travel',
+      requestId: 'binary-checkpoint-rejected',
+      action: 'apply',
+      targets: [{ componentId: binaryId ?? '', checkpointId: binaryCheckpoint ?? '' }]
+    }));
+    await settle();
+    const binaryResult = received.findLast(
+      (event): event is Extract<PageEvent, { type: 'time-travel-result' }> =>
+        event.type === 'time-travel-result' && event.payload.requestId === 'binary-checkpoint-rejected'
+    );
+    expect(binaryResult?.payload.failures?.some((failure) =>
+      failure.reason.includes('Binary state exceeds the checkpoint limit')
+    )).toBe(true);
+
+    let boundedHistory = 0;
+    const boundedHistoryId = hook?.beginComponent({
+      name: 'BoundedHistory',
+      file: 'src/BoundedHistory.svelte',
+      props: () => ({}),
+      state: {
+        boundedHistory: {
+          get: () => boundedHistory,
+          set: (value) => { boundedHistory = Number(value); }
+        }
+      },
+      derived: {}
+    });
+    hook?.endComponent(boundedHistoryId ?? null);
+    for (let index = 0; index < 20; index++) {
+      boundedHistory = index;
+      hook?.updateComponent(boundedHistoryId ?? null, index === 0 ? 'init' : 'update');
+    }
+    dispatch(contentMessage(null, { kind: 'snapshot', requestId: 'bounded-checkpoint-history' }));
+    await settle();
+    const boundedHistorySnapshot = received.findLast(
+      (event): event is Extract<PageEvent, { type: 'snapshot' }> =>
+        event.type === 'snapshot' && event.payload.requestId === 'bounded-checkpoint-history'
+    );
+    const boundedHistoryDetail = boundedHistorySnapshot?.payload.nodes.find(
+      (node) => node.id === boundedHistoryId
+    )?.detail;
+    expect(isRecord(boundedHistoryDetail) && Array.isArray(boundedHistoryDetail.checkpoints)
+      ? boundedHistoryDetail.checkpoints.length
+      : -1).toBe(12);
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 550));
+    dispatch(contentMessage(null, { kind: 'record', enabled: false }));
+    const fullScans = vi.spyOn(document, 'querySelectorAll');
+    const snapshotsBeforeBurst = received.filter((event) => event.type === 'snapshot').length;
+    dispatch(contentMessage(null, { kind: 'record', enabled: true }));
+    const burstHost = document.createElement('div');
+    document.body.append(burstHost);
+    const largeRouteRoot = document.createElement('section');
+    largeRouteRoot.append(...Array.from({ length: 2_000 }, () => document.createElement('i')));
+    const routeSubtreeScans = vi.spyOn(largeRouteRoot, 'querySelectorAll');
+    burstHost.append(largeRouteRoot);
+    await Promise.resolve();
+    for (let batch = 0; batch < 250; batch++) {
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 4; index++) fragment.append(document.createElement('span'));
+      burstHost.append(fragment);
+      // Deliver hundreds of MutationObserver batches before the next frame.
+      await Promise.resolve();
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    expect(fullScans).toHaveBeenCalledTimes(1);
+    expect(routeSubtreeScans).not.toHaveBeenCalled();
+    expect(received.filter((event) => event.type === 'snapshot').length - snapshotsBeforeBurst).toBe(1);
+    routeSubtreeScans.mockRestore();
+    fullScans.mockRestore();
+
+    const highlightId = hook?.beginComponent({
+      name: 'HugeHighlight',
+      file: 'src/HugeHighlight.svelte',
+      props: () => ({}),
+      state: {},
+      derived: {}
+    });
+    const highlightHost = document.createElement('div');
+    let rectReads = 0;
+    for (let index = 0; index < 600; index++) {
+      const element = document.createElement('span');
+      element.__svelte_meta = {
+        parent: null,
+        loc: { file: 'src/HugeHighlight.svelte', line: index + 1, column: 0 }
+      };
+      element.getClientRects = () => {
+        rectReads++;
+        return [{ top: 10, left: 10, width: 20, height: 20 }] as unknown as DOMRectList;
+      };
+      highlightHost.append(element);
+    }
+    document.body.append(highlightHost);
+    hook?.endComponent(highlightId ?? null);
+    await new Promise<void>((resolve) => setTimeout(resolve, 180));
+    rectReads = 0;
+    for (let index = 0; index < 100; index++) {
+      dispatch(contentMessage(null, {
+        kind: 'highlight',
+        componentId: highlightId ?? null,
+        reveal: false
+      }));
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    expect(rectReads).toBeLessThanOrEqual(256);
+    const overlayHost = document.querySelector('[data-svelte-lens-overlay]');
+    expect(overlayHost?.shadowRoot?.children.length ?? 0).toBeLessThanOrEqual(33);
+    dispatch(contentMessage(null, { kind: 'highlight', componentId: null }));
+
+    const pickerScans = vi.spyOn(document, 'querySelectorAll');
+    rectReads = 0;
+    dispatch(contentMessage(null, { kind: 'picker', action: 'start' }));
+    highlightHost.firstElementChild?.dispatchEvent(new MouseEvent('pointermove', { bubbles: true }));
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    expect(pickerScans).not.toHaveBeenCalled();
+    expect(rectReads).toBeLessThanOrEqual(256);
+    dispatch(contentMessage(null, { kind: 'picker', action: 'stop' }));
+    pickerScans.mockRestore();
+
     const recursiveDescriptor = {
       name: 'Foo',
       file: 'src/Foo.svelte',
@@ -1301,7 +1565,7 @@ describe('MAIN-world page hook', () => {
     ] as { destroy?: () => void } | undefined;
     sentinel?.destroy?.();
     expect(pauseRestore).toBe(30);
-  });
+  }, 10_000);
 });
 
 function dispatch(data: unknown): void {

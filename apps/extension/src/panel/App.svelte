@@ -1,10 +1,15 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import ComponentTree from './ComponentTree.svelte';
+  import RuneObjectInspector, {
+    type RuneObjectInspection
+  } from './RuneObjectInspector.svelte';
   import type {
     HelloPayload,
     JsonValue,
     PageCommand,
     PageEvent,
+    RuneObjectSummary,
     SnapshotNode,
     SourceLocation,
     TraceRecord
@@ -16,7 +21,7 @@
   } from './transport';
 
   type Detail = Record<string, JsonValue>;
-  type TreeRow = SnapshotNode & { depth: number; hasChildren: boolean };
+  type MainView = 'activity' | 'inspector' | 'runes';
   type CenterView = 'updates' | 'effects';
   type EffectStatus = 'active' | 'error' | 'disposed';
 
@@ -55,6 +60,14 @@
     at?: number;
   };
 
+  function createLookup<Value>(): Record<string, Value> {
+    return Object.create(null) as Record<string, Value>;
+  }
+
+  function clearLookup<Value>(lookup: Record<string, Value>): void {
+    for (const key of Object.keys(lookup)) delete lookup[key];
+  }
+
   const requestId = () => crypto.randomUUID();
 
   let connection: PanelConnection | null = null;
@@ -67,6 +80,7 @@
   let selectedId = $state<string | null>(null);
   let selectedTraceId = $state<string | null>(null);
   let selectedEffectId = $state<string | null>(null);
+  let mainView = $state<MainView>('activity');
   let centerView = $state<CenterView>('updates');
   let showAllEffects = $state(false);
   let query = $state('');
@@ -74,9 +88,14 @@
   let recording = $state(true);
   let gap = $state<string | null>(null);
   let notice = $state<string | null>(null);
-  let expanded = $state<Record<string, boolean>>({});
   let editingStateKey = $state<string | null>(null);
   let editingStateValue = $state('');
+  let traceList = $state<HTMLDivElement | null>(null);
+  let followUpdates = $state(true);
+  let runeObjects = $state<RuneObjectSummary[]>([]);
+  let runeInspections = $state<Record<string, RuneObjectInspection>>({});
+  let loadingRuneObjectIds = $state<string[]>([]);
+  const runeInspectRequests = createLookup<string>();
 
   const selected = $derived(nodes.find((node) => node.id === selectedId) ?? null);
   const selectedTrace = $derived(traces.find((trace) => trace.id === selectedTraceId) ?? null);
@@ -84,29 +103,33 @@
   const selectedTraceDetail = $derived(asDetail(selectedTrace?.detail));
   const selectedInvocation = $derived(asDetail(selectedDetail?.invocation));
   const treeNodes = $derived(nodes.filter((node) => node.kind !== 'element' && node.kind !== 'text'));
-  const rows = $derived(buildRows(treeNodes, expanded, query));
   const components = $derived(nodes.filter((node) => node.kind === 'component'));
+  const nodesById = $derived.by(() => {
+    const lookup = createLookup<SnapshotNode>();
+    for (const node of nodes) lookup[node.id] = node;
+    return lookup;
+  });
   const timelineMode = $derived(readTimelineMode(nodes));
   const effects = $derived(collectEffects(nodes, traces, hasSnapshot));
   const effectsByComponent = $derived.by(() => {
-    const grouped = new Map<string, EffectSummary[]>();
+    const grouped = createLookup<EffectSummary[]>();
     for (const effect of effects) {
-      const componentEffects = grouped.get(effect.componentId) ?? [];
+      const componentEffects = grouped[effect.componentId] ?? [];
       componentEffects.push(effect);
-      grouped.set(effect.componentId, componentEffects);
+      grouped[effect.componentId] = componentEffects;
     }
     return grouped;
   });
   const effectTotalsByComponent = $derived.by(() => {
-    const totals = new Map<string, number>();
+    const totals = createLookup<number>();
     for (const component of components) {
       const detail = asDetail(component.detail);
-      const visible = effectsByComponent.get(component.id)?.length ?? 0;
+      const visible = effectsByComponent[component.id]?.length ?? 0;
       const reported = countValue(
         detail?.effectTotal,
         asDetails(detail?.effects).length + countValue(detail?.effectsOmitted)
       );
-      totals.set(component.id, Math.max(visible, reported));
+      totals[component.id] = Math.max(visible, reported);
     }
     return totals;
   });
@@ -114,7 +137,7 @@
   const visibleEffects = $derived(
     showAllEffects || !selectedId
       ? effects
-      : effectsByComponent.get(selectedId) ?? []
+      : effectsByComponent[selectedId] ?? []
   );
   const totalEffectCount = $derived.by(() => {
     const mounted = new Set(components.map((component) => component.id));
@@ -141,6 +164,12 @@
         selectedId = null;
         selectedTraceId = null;
         selectedEffectId = null;
+        mainView = 'activity';
+        followUpdates = true;
+        runeObjects = [];
+        runeInspections = {};
+        loadingRuneObjectIds = [];
+        clearLookup(runeInspectRequests);
         editingStateKey = null;
         hello = null;
         gap = null;
@@ -179,20 +208,18 @@
 
     if (event.type === 'snapshot') {
       nodes = event.payload.nodes;
+      updateRuneObjects(event.payload.runeObjects ?? []);
       hasSnapshot = true;
-      const nextExpanded = { ...expanded };
-      for (const node of nodes) {
-        if (!(node.id in nextExpanded)) nextExpanded[node.id] = true;
-      }
-      expanded = nextExpanded;
       if (selectedId && !nodes.some((node) => node.id === selectedId)) selectedId = null;
       return;
     }
 
     if (event.type === 'trace') {
-      const byId = new Map(traces.map((trace) => [trace.id, trace]));
-      for (const trace of event.payload.events) byId.set(trace.id, trace);
-      traces = [...byId.values()].sort((a, b) => a.at - b.at).slice(-500);
+      const byId = createLookup<TraceRecord>();
+      for (const trace of traces) byId[trace.id] = trace;
+      for (const trace of event.payload.events) byId[trace.id] = trace;
+      traces = Object.values(byId).sort((a, b) => a.at - b.at).slice(-500);
+      if (followUpdates && centerView === 'updates') void scrollToLatestUpdates();
       return;
     }
 
@@ -205,6 +232,23 @@
     }
 
     if (event.type === 'command-result') {
+      const runeObjectId = runeInspectRequests[event.payload.requestId];
+      if (runeObjectId) {
+        delete runeInspectRequests[event.payload.requestId];
+        loadingRuneObjectIds = loadingRuneObjectIds.filter((id) => id !== runeObjectId);
+        if (event.payload.ok) {
+          const inspection = parseRuneObjectInspection(event.payload.data);
+          if (inspection?.id === runeObjectId) {
+            runeInspections = { ...runeInspections, [runeObjectId]: inspection };
+            notice = null;
+          } else {
+            notice = 'The rune object returned an invalid inspection payload';
+          }
+        } else {
+          notice = event.payload.error ?? 'Rune object inspection failed';
+        }
+        return;
+      }
       notice = event.payload.ok ? null : event.payload.error ?? 'Command failed';
       return;
     }
@@ -233,6 +277,32 @@
     send({ kind: 'snapshot', requestId: requestId() });
   }
 
+  function updateRuneObjects(next: RuneObjectSummary[]) {
+    runeObjects = next;
+    const liveIds = new Set(next.map((object) => object.id));
+    runeInspections = Object.fromEntries(
+      Object.entries(runeInspections).filter(([id]) => liveIds.has(id))
+    );
+    loadingRuneObjectIds = loadingRuneObjectIds.filter((id) => liveIds.has(id));
+    for (const [pendingRequestId, objectId] of Object.entries(runeInspectRequests)) {
+      if (!liveIds.has(objectId)) delete runeInspectRequests[pendingRequestId];
+    }
+  }
+
+  function inspectRuneObject(object: RuneObjectSummary) {
+    if (loadingRuneObjectIds.includes(object.id)) return;
+    const id = requestId();
+    runeInspectRequests[id] = object.id;
+    loadingRuneObjectIds = [...loadingRuneObjectIds, object.id];
+    send({ kind: 'inspect-rune-object', requestId: id, objectId: object.id });
+  }
+
+  function previewRuneObjectOwner(object: RuneObjectSummary) {
+    if (!object.ownerComponentId) return;
+    selectedId = object.ownerComponentId;
+    send({ kind: 'highlight', componentId: object.ownerComponentId });
+  }
+
   function togglePicker() {
     pickerActive = !pickerActive;
     send({ kind: 'picker', action: pickerActive ? 'start' : 'stop' });
@@ -249,15 +319,12 @@
     selectedTraceId = null;
     selectedEffectId = null;
     editingStateKey = null;
+    mainView = 'inspector';
     send({ kind: 'highlight', componentId: id, reveal });
   }
 
   function hoverNode(id: string | null) {
     send({ kind: 'highlight', componentId: id ?? selectedId });
-  }
-
-  function toggleExpanded(id: string) {
-    expanded = { ...expanded, [id]: expanded[id] === false };
   }
 
   function selectTrace(trace: TraceRecord) {
@@ -270,6 +337,7 @@
       selectedId = trace.componentId;
       send({ kind: 'highlight', componentId: trace.componentId });
     }
+    mainView = 'inspector';
   }
 
   function selectEffect(effect: EffectSummary) {
@@ -278,7 +346,47 @@
     editingStateKey = null;
     const latest = effectRunTraces.findLast((trace) => asDetail(trace.detail)?.effectId === effect.id);
     selectedTraceId = latest?.id ?? null;
+    mainView = 'inspector';
     send({ kind: 'highlight', componentId: effect.componentId });
+  }
+
+  async function scrollToLatestUpdates(force = false) {
+    if (force) followUpdates = true;
+    await tick();
+    if (!traceList || !followUpdates) return;
+    traceList.scrollTop = traceList.scrollHeight;
+  }
+
+  function traceListAttachment(element: HTMLDivElement) {
+    traceList = element;
+    const follow = () => {
+      if (traceList === element && followUpdates && centerView === 'updates') {
+        element.scrollTop = element.scrollHeight;
+      }
+    };
+    const resizeObserver = new ResizeObserver(follow);
+    resizeObserver.observe(element);
+    queueMicrotask(follow);
+    return () => {
+      resizeObserver.disconnect();
+      if (traceList === element) traceList = null;
+    };
+  }
+
+  function showActivity() {
+    mainView = 'activity';
+    if (centerView === 'updates' && followUpdates) void scrollToLatestUpdates();
+  }
+
+  function showUpdates() {
+    centerView = 'updates';
+    if (followUpdates) void scrollToLatestUpdates();
+  }
+
+  function trackUpdateScroll() {
+    if (!traceList) return;
+    const distance = traceList.scrollHeight - traceList.clientHeight - traceList.scrollTop;
+    followUpdates = distance <= 32;
   }
 
   function rewind(trace: TraceRecord) {
@@ -400,6 +508,47 @@
       typeof detail.column !== 'number'
     ) return undefined;
     return { file: detail.file, line: detail.line, column: detail.column };
+  }
+
+  function parseRuneObjectInspection(value: JsonValue | undefined): RuneObjectInspection | null {
+    const detail = asDetail(value);
+    const source = readSource(detail?.source);
+    const rawFields = asDetail(detail?.fields);
+    if (
+      !detail ||
+      typeof detail.id !== 'string' ||
+      typeof detail.name !== 'string' ||
+      typeof detail.file !== 'string' ||
+      !source ||
+      !rawFields ||
+      typeof detail.totalFields !== 'number' ||
+      typeof detail.truncated !== 'boolean' ||
+      (detail.ownerComponentId !== null && typeof detail.ownerComponentId !== 'string')
+    ) return null;
+
+    const fields: RuneObjectInspection['fields'] = {};
+    for (const [name, rawValue] of Object.entries(rawFields).slice(0, 64)) {
+      const field = asDetail(rawValue);
+      const fieldSource = readSource(field?.source);
+      if (
+        !field ||
+        (field.kind !== 'state' && field.kind !== 'derived') ||
+        !fieldSource ||
+        !Object.hasOwn(field, 'value')
+      ) return null;
+      fields[name] = { kind: field.kind, source: fieldSource, value: field.value as JsonValue };
+    }
+
+    return {
+      id: detail.id,
+      name: detail.name,
+      file: detail.file,
+      source,
+      ownerComponentId: detail.ownerComponentId,
+      fields,
+      totalFields: Math.max(0, Math.floor(detail.totalFields)),
+      truncated: detail.truncated
+    };
   }
 
   function countValue(value: JsonValue | undefined, fallback = 0): number {
@@ -564,12 +713,12 @@
     receipts: TraceRecord[],
     snapshotAuthoritative: boolean
   ): EffectSummary[] {
-    const byId = new Map<string, EffectSummary>();
+    const byId = createLookup<EffectSummary>();
     for (const node of values) {
       const detail = asDetail(node.detail);
       for (const raw of asDetails(detail?.effects)) {
         const effect = parseEffect(raw, node.id);
-        if (effect) byId.set(effect.id, mergeEffect(byId.get(effect.id), effect));
+        if (effect) byId[effect.id] = mergeEffect(byId[effect.id], effect);
       }
     }
     for (const trace of receipts) {
@@ -578,12 +727,10 @@
       if (!raw) continue;
       const effect = parseEffect(raw, trace.componentId, trace.at);
       if (!effect) continue;
-      byId.set(
-        effect.id,
+      byId[effect.id] =
         trace.kind === 'effect-cleanup'
-          ? mergeCleanupEffect(byId.get(effect.id), effect, countValue(raw.originatingRun))
-          : mergeEffect(byId.get(effect.id), effect)
-      );
+          ? mergeCleanupEffect(byId[effect.id], effect, countValue(raw.originatingRun))
+          : mergeEffect(byId[effect.id], effect);
     }
     const unmounted = new Set(
       receipts.flatMap((trace) => trace.kind === 'unmount' && trace.componentId ? [trace.componentId] : [])
@@ -593,74 +740,23 @@
     );
     const completeSnapshot = snapshotAuthoritative &&
       !values.some((node) => node.id === 'svelte-lens:snapshot-truncated');
-    for (const effect of byId.values()) {
+    for (const effect of Object.values(byId)) {
       if (unmounted.has(effect.componentId) || (completeSnapshot && !mounted.has(effect.componentId))) {
         effect.status = 'disposed';
       }
     }
-    const componentOrder = new Map(values.map((node, index) => [node.id, index]));
-    return [...byId.values()].sort((left, right) => {
-      const owner = (componentOrder.get(left.componentId) ?? Number.MAX_SAFE_INTEGER) -
-        (componentOrder.get(right.componentId) ?? Number.MAX_SAFE_INTEGER);
+    const componentOrder = createLookup<number>();
+    values.forEach((node, index) => {
+      componentOrder[node.id] = index;
+    });
+    return Object.values(byId).sort((left, right) => {
+      const owner = (componentOrder[left.componentId] ?? Number.MAX_SAFE_INTEGER) -
+        (componentOrder[right.componentId] ?? Number.MAX_SAFE_INTEGER);
       if (owner !== 0) return owner;
       const line = (left.source?.line ?? Number.MAX_SAFE_INTEGER) -
         (right.source?.line ?? Number.MAX_SAFE_INTEGER);
       return line !== 0 ? line : left.id.localeCompare(right.id);
     });
-  }
-
-  function buildRows(
-    values: SnapshotNode[],
-    open: Record<string, boolean>,
-    search: string
-  ): TreeRow[] {
-    const byParent = new Map<string | null, SnapshotNode[]>();
-    const ids = new Set(values.map((value) => value.id));
-    for (const value of values) {
-      const parentId = value.parentId && ids.has(value.parentId) ? value.parentId : null;
-      const list = byParent.get(parentId) ?? [];
-      list.push(value);
-      byParent.set(parentId, list);
-    }
-
-    const needle = search.trim().toLowerCase();
-    const visible = new Set<string>();
-    if (needle) {
-      const parentOf = new Map(values.map((value) => [value.id, value.parentId ?? null]));
-      for (const value of values) {
-        const source = value.source?.file ?? '';
-        if (`${value.name} ${source}`.toLowerCase().includes(needle)) {
-          let id: string | null = value.id;
-          const ancestors = new Set<string>();
-          while (id && !ancestors.has(id)) {
-            ancestors.add(id);
-            visible.add(id);
-            id = parentOf.get(id) ?? null;
-          }
-        }
-      }
-    }
-
-    const result: TreeRow[] = [];
-    const roots = byParent.get(null) ?? [];
-    const stack = roots.map((value) => ({ value, depth: 0 })).reverse();
-    const visited = new Set<string>();
-    while (stack.length > 0) {
-      const item = stack.pop();
-      if (!item || visited.has(item.value.id)) continue;
-      visited.add(item.value.id);
-      if (needle && !visible.has(item.value.id)) continue;
-
-      const children = byParent.get(item.value.id) ?? [];
-      result.push({ ...item.value, depth: Math.min(item.depth, 64), hasChildren: children.length > 0 });
-      if (open[item.value.id] !== false) {
-        for (let index = children.length - 1; index >= 0; index--) {
-          const child = children[index];
-          if (child) stack.push({ value: child, depth: item.depth + 1 });
-        }
-      }
-    }
-    return result;
   }
 
   function shortFile(file: string | undefined) {
@@ -671,15 +767,15 @@
 
   function componentName(id: string | undefined) {
     if (!id) return 'Page';
-    return nodes.find((node) => node.id === id)?.name ?? id;
+    return nodesById[id]?.name ?? id;
   }
 
   function effectsForComponent(componentId: string) {
-    return effectsByComponent.get(componentId) ?? [];
+    return effectsByComponent[componentId] ?? [];
   }
 
   function effectCount(componentId: string) {
-    return effectTotalsByComponent.get(componentId) ?? effectsForComponent(componentId).length;
+    return effectTotalsByComponent[componentId] ?? effectsForComponent(componentId).length;
   }
 
   function omittedEffectCount(componentId: string) {
@@ -986,57 +1082,51 @@
           <input bind:value={query} placeholder="Filter components" />
           {#if query}<button onclick={() => (query = '')}>×</button>{/if}
         </label>
-        <div class="tree" role="tree" aria-label="Svelte component tree">
-          {#if rows.length === 0}
+        {#key sessionId}
+          {#if treeNodes.length === 0}
             <div class="empty compact">
               {status === 'connected' ? 'No Svelte dev nodes yet.' : 'Waiting for the inspected page…'}
             </div>
+          {:else}
+            <ComponentTree
+              nodes={treeNodes}
+              {selectedId}
+              {query}
+              {effectCount}
+              {effectErrorCount}
+              onSelect={(id) => selectNode(id, true)}
+              onHover={hoverNode}
+            />
           {/if}
-          {#each rows as row (row.id)}
-            <button
-              class:selected={selectedId === row.id}
-              class:subtle={row.kind !== 'component'}
-              class="tree-row"
-              style:--depth={row.depth}
-              onclick={(event) => {
-                if ((event.target as HTMLElement).closest('.disclosure')) toggleExpanded(row.id);
-                else selectNode(row.id, true);
-              }}
-              onmouseenter={() => hoverNode(row.id)}
-              onmouseleave={() => hoverNode(null)}
-              role="treeitem"
-              aria-selected={selectedId === row.id}
-            >
-              <span
-                class:empty={!row.hasChildren}
-                class="disclosure"
-              >{row.hasChildren ? (expanded[row.id] === false ? '›' : '⌄') : '·'}</span>
-              <span class:component={row.kind === 'component'} class="node-icon"></span>
-              <span class="node-label">{row.name}</span>
-              {#if asDetail(row.detail)?.enhanced === true}<span class="enhanced" title="Vite instrumentation active">●</span>{/if}
-              {#if effectCount(row.id) > 0}
-                <span
-                  class:error={effectErrorCount(row.id) > 0}
-                  class="effect-count"
-                  title={`${effectCount(row.id)} instrumented effect${effectCount(row.id) === 1 ? '' : 's'}${effectErrorCount(row.id) ? ` · ${effectErrorCount(row.id)} errored` : ''}`}
-                >fx {effectCount(row.id)}</span>
-              {/if}
-              {#if typeof asDetail(row.detail)?.updateCount === 'number'}
-                <span class="update-count">{asDetail(row.detail)?.updateCount}</span>
-              {/if}
-            </button>
-          {/each}
-        </div>
+        {/key}
       </section>
 
-      <section class="pane trace-pane">
+      <nav class="workspace-view-tabs" aria-label="Panel view">
+        <button
+          class:active={mainView === 'activity'}
+          aria-current={mainView === 'activity' ? 'page' : undefined}
+          onclick={showActivity}
+        >Activity <span>{traces.length}</span></button>
+        <button
+          class:active={mainView === 'inspector'}
+          aria-current={mainView === 'inspector' ? 'page' : undefined}
+          onclick={() => (mainView = 'inspector')}
+        >Inspector{#if selected}<span>{selected.name}</span>{/if}</button>
+        <button
+          class:active={mainView === 'runes'}
+          aria-current={mainView === 'runes' ? 'page' : undefined}
+          onclick={() => (mainView = 'runes')}
+        >Rune state <span>{runeObjects.length}</span></button>
+      </nav>
+
+      <section class:view-hidden={mainView !== 'activity'} class="pane trace-pane">
         <div class="pane-header trace-header">
           <div class="center-tabs" role="tablist" aria-label="Svelte activity views">
             <button
               class:active={centerView === 'updates'}
               role="tab"
               aria-selected={centerView === 'updates'}
-              onclick={() => (centerView = 'updates')}
+              onclick={showUpdates}
             >Updates <span>{traces.length}</span></button>
             <button
               class:active={centerView === 'effects'}
@@ -1063,7 +1153,7 @@
         </div>
 
         {#if centerView === 'updates'}
-          <div class="trace-list">
+          <div class="trace-list" {@attach traceListAttachment} onscroll={trackUpdateScroll}>
           {#if traces.length === 0}
             <div class="empty">
               <span class="empty-orbit"><i></i></span>
@@ -1155,6 +1245,7 @@
             </div>
           </div>
           <div class="time-actions">
+            {#if !followUpdates}<button onclick={() => scrollToLatestUpdates(true)}>↓ Latest</button>{/if}
             <button disabled={!canRewind(selectedTrace)} onclick={() => selectedTrace && rewind(selectedTrace)}>↶ Rewind here</button>
             <button disabled={timelineMode === 'live'} onclick={goLive}>Go live</button>
           </div>
@@ -1170,7 +1261,7 @@
         {/if}
       </section>
 
-      <aside class="pane inspector-pane">
+      <aside class:view-hidden={mainView !== 'inspector'} class="pane inspector-pane">
         <div class="inspector-top">
           <span class="pane-title">Inspector</span>
           {#if selectedEffect}
@@ -1251,7 +1342,7 @@
               <div class="section-empty reason-empty">{missingTriggerEvidence(selectedEffect, selectedRun)}</div>
             {:else}
               <div class="dependency-table changes-table">
-                {#each triggers as trigger}
+                {#each triggers as trigger, triggerIndex (dependencyId(trigger) ?? `trigger:${triggerIndex}`)}
                   <div class="dependency-row changed">
                     <div class="dependency-heading">
                       <code>{dependencyLabel(trigger)}</code>
@@ -1272,7 +1363,7 @@
                     {#if asStrings(trigger.updatedAt).length > 0}
                       <details class="stack-details">
                         <summary>Update stack{asStrings(trigger.updatedAt).length === 1 ? '' : 's'}</summary>
-                        {#each asStrings(trigger.updatedAt) as stack}<pre>{stack}</pre>{/each}
+                        {#each asStrings(trigger.updatedAt) as stack, stackIndex (`${stack}:${stackIndex}`)}<pre>{stack}</pre>{/each}
                       </details>
                     {/if}
                   </div>
@@ -1291,7 +1382,7 @@
             {/if}
             {#if dependencies.length > 0}
               <div class="dependency-table">
-                {#each dependencies as dependency}
+                {#each dependencies as dependency, dependencyIndex (dependencyId(dependency) ?? `dependency:${dependencyIndex}`)}
                   {@const id = dependencyId(dependency)}
                   <div class:added={id !== null && addedIds.includes(id)} class="dependency-row">
                     <div class="dependency-heading">
@@ -1305,7 +1396,7 @@
                       <details class="stack-details">
                         <summary>Source stack{asStrings(dependency.updatedAt).length === 1 ? '' : 's'}</summary>
                         {#if typeof dependency.createdAt === 'string'}<pre>{dependency.createdAt}</pre>{/if}
-                        {#each asStrings(dependency.updatedAt) as stack}<pre>{stack}</pre>{/each}
+                        {#each asStrings(dependency.updatedAt) as stack, stackIndex (`${stack}:${stackIndex}`)}<pre>{stack}</pre>{/each}
                       </details>
                     {/if}
                   </div>
@@ -1315,7 +1406,7 @@
               <div class="section-empty">No synchronous reactive reads were reported for this run.</div>
             {/if}
             {#if removedIds.length > 0}
-              <div class="dependency-delta"><span>Stopped tracking</span>{#each removedIds as id}<code>{id}</code>{/each}</div>
+              <div class="dependency-delta"><span>Stopped tracking</span>{#each removedIds as id (id)}<code>{id}</code>{/each}</div>
             {/if}
           </section>
           {/if}
@@ -1398,7 +1489,7 @@
             {/if}
           </section>
 
-          {#each ['props', 'state', 'derived'] as section}
+          {#each ['props', 'state', 'derived'] as section (section)}
             {@const value = selectedDetail?.[section]}
             <section class="inspector-section">
               <div class="section-title">
@@ -1407,7 +1498,7 @@
               </div>
               {#if value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0}
                 <div class="value-table">
-                  {#each Object.entries(value) as [key, entry]}
+                  {#each Object.entries(value) as [key, entry] (key)}
                     {@const writable = section === 'state' && asDetail(selectedDetail?.writableState)?.[key] === true && isEditablePreview(entry)}
                     <div class:value-editing={editingStateKey === key && section === 'state'} class="value-row">
                       <code>{key}</code>
@@ -1477,6 +1568,17 @@
           </div>
         {/if}
       </aside>
+
+      <section class:view-hidden={mainView !== 'runes'} class="pane rune-pane">
+        <RuneObjectInspector
+          objects={runeObjects}
+          inspections={runeInspections}
+          loadingIds={loadingRuneObjectIds}
+          oninspect={inspectRuneObject}
+          onopenSource={openSourceAt}
+          onselect={previewRuneObjectOwner}
+        />
+      </section>
     </main>
   {/if}
 
@@ -1485,6 +1587,7 @@
     <span>{sessionId ? `session ${sessionId.slice(0, 8)}` : 'no page session'}</span>
     <span class="spacer"></span>
     <span class:available={hello?.capabilities.effects}>{hello?.capabilities.effects ? 'effect instrumentation' : 'effects unavailable'}</span>
+    <span class:available={hello?.capabilities.runeObjects}>{hello?.capabilities.runeObjects ? 'rune objects' : 'rune objects unavailable'}</span>
     <span class:available={hello?.capabilities.state}>{hello?.capabilities.state ? 'enhanced state capture' : 'metadata capture'}</span>
   </footer>
 </div>

@@ -8,7 +8,6 @@ import { parse } from "svelte/compiler";
 const SOURCE_MARKER = "/* svelte-lens:component */";
 const END_MARKER = "/* svelte-lens:end */";
 const RUNTIME_MARKER = "/* svelte-lens:runtime */";
-const TRACING_IMPORT = 'svelte/internal/flags/tracing';
 
 type AstNode = {
   type: string;
@@ -740,16 +739,13 @@ interface CompiledAnalysis {
   namespace: string;
   namespaceImport: JsNode;
   effects: CompiledEffectCall[];
-  hasTracingImport: boolean;
 }
 
 function analyzeCompiledJavaScript(program: JsNode): CompiledAnalysis | null {
   let namespace: string | null = null;
   let namespaceImport: JsNode | null = null;
-  let hasTracingImport = false;
   walkJavaScript(program, (node) => {
     if (node.type !== "ImportDeclaration" || !isNode(node.source)) return;
-    if (node.source.value === TRACING_IMPORT) hasTracingImport = true;
     if (namespace) return;
     if (node.source.value !== "svelte/internal/client" || !Array.isArray(node.specifiers)) return;
     for (const specifier of node.specifiers) {
@@ -780,7 +776,7 @@ function analyzeCompiledJavaScript(program: JsNode): CompiledAnalysis | null {
     const argument = node.arguments[0];
     if (kind && isJsNode(argument)) effects.push({ argument, callee, kind });
   });
-  return { namespace, namespaceImport, effects, hasTracingImport };
+  return { namespace, namespaceImport, effects };
 }
 
 function resolveEffectSource(
@@ -917,12 +913,9 @@ export function instrumentCompiledSvelte(
       magic.appendRight(effect.argument.end, ")");
     }
     if (componentEffects.length > 0) {
-      const enableTracing = analysis.hasTracingImport
-        ? ""
-        : `, enableTracing: () => import(${JSON.stringify(TRACING_IMPORT)})`;
       magic.appendRight(
         analysis.namespaceImport.end,
-        `\n${RUNTIME_MARKER}\nglobalThis.__SVELTE_LENS__?.installRuntime?.(() => ({ activeEffect: ${analysis.namespace}.active_effect, untrack: ${analysis.namespace}.untrack${enableTracing} }));`,
+        `\n${RUNTIME_MARKER}\nglobalThis.__SVELTE_LENS__?.installRuntime?.(() => ({ activeEffect: ${analysis.namespace}.active_effect, untrack: ${analysis.namespace}.untrack }));`,
       );
     }
   }

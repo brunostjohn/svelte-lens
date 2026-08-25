@@ -4,8 +4,8 @@ import { fileURLToPath } from "node:url";
 import { originalPositionFor, TraceMap } from "@jridgewell/trace-mapping";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { compile } from "svelte/compiler";
-import { createServer } from "vite";
-import { describe, expect, it } from "vitest";
+import { build, createServer } from "vite";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { svelteLens } from "../src/index.js";
 import {
@@ -158,7 +158,7 @@ describe("instrumentCompiledSvelte", () => {
     expect(result.code).toMatch(/"kind":\s*"effect"/);
     expect(result.code).toMatch(/"kind":\s*"pre"/);
     expect(result.code).not.toMatch(/"kind":\s*"root"/);
-    expect(result.code).toContain('enableTracing: () => import("svelte/internal/flags/tracing")');
+    expect(result.code).not.toContain('svelte/internal/flags/tracing');
     expect(result.code).toContain("activeEffect: $.active_effect, untrack: $.untrack");
     expect(result.code).toMatch(/"siteId":\s*"site:/);
     expect(result.code).toMatch(
@@ -172,7 +172,7 @@ describe("instrumentCompiledSvelte", () => {
     );
   });
 
-  it("does not duplicate Svelte's tracing side effect when the component already uses inspect.trace", () => {
+  it("preserves user-authored inspect.trace without adding another tracing side effect", () => {
     const source = `<script>
       let count = $state(0);
       $effect(() => { $inspect.trace('existing'); count; });
@@ -196,7 +196,7 @@ describe("instrumentCompiledSvelte", () => {
     const result = instrumentCompiledSvelte(compiled.code, filename);
     if (!result) throw new Error("Expected compiled instrumentation");
 
-    expect(result.code).toContain('enableTracing: () => import("svelte/internal/flags/tracing")');
+    expect(result.code).not.toContain('import("svelte/internal/flags/tracing")');
   });
 
   it("does not bind module-script effects to a component-local identifier", () => {
@@ -365,19 +365,123 @@ function Counter() {
 });
 
 describe("svelteLens", () => {
-  it("returns serve-only pre and post plugins", () => {
+  beforeEach(() => {
+    vi.stubEnv("IN_PLAYWRIGHT", "false");
+    vi.stubEnv("VITE_PLAYWRIGHT", "false");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("returns fail-closed development-server-only instrumentation plugins", () => {
     const plugins = svelteLens();
     expect(plugins.map((plugin) => plugin.name)).toEqual([
       "svelte-lens:instrument-source",
       "svelte-lens:instrument-compiled",
+      "svelte-lens:instrument-rune-objects",
     ]);
-    expect(plugins.map((plugin) => plugin.enforce)).toEqual(["pre", "post"]);
-    expect(plugins.map((plugin) => plugin.apply)).toEqual(["serve", "serve"]);
+    expect(plugins.map((plugin) => plugin.enforce)).toEqual(["pre", "post", "post"]);
+    for (const plugin of plugins) {
+      if (typeof plugin.apply !== "function") throw new Error("Expected an explicit environment gate");
+      expect(plugin.apply({}, { command: "build", mode: "production" })).toBe(false);
+      expect(plugin.apply({}, { command: "build", mode: "development" })).toBe(false);
+      expect(plugin.apply({}, { command: "serve", mode: "production", isPreview: true })).toBe(false);
+      expect(plugin.apply({}, { command: "serve", mode: "development" })).toBe(true);
+    }
   });
 
   it("can be disabled", () => {
     expect(svelteLens({ enabled: false })).toEqual([]);
   });
+
+  it.each(["IN_PLAYWRIGHT", "VITE_PLAYWRIGHT"])(
+    "returns no plugins when %s is exactly true",
+    (environmentVariable) => {
+      vi.stubEnv(environmentVariable, "true");
+      expect(svelteLens()).toEqual([]);
+      expect(svelteLens({ enabled: true })).toEqual([]);
+    },
+  );
+
+  it("stays inert if the Reintersect Playwright flag appears after Vite config resolution", async () => {
+    const root = fileURLToPath(new URL("./fixtures", import.meta.url));
+    const server = await createServer({
+      root,
+      configFile: false,
+      logLevel: "silent",
+      optimizeDeps: { noDiscovery: true },
+      plugins: [svelteLens(), svelte()],
+      server: { middlewareMode: true },
+    });
+
+    try {
+      vi.stubEnv("IN_PLAYWRIGHT", "true");
+      const transformed = await server.transformRequest("/OneLine.svelte");
+      expect(transformed?.code).not.toContain("__SVELTE_LENS__");
+      expect(transformed?.code).not.toContain("__svelte_lens_");
+      expect(transformed?.code).not.toContain("svelte/internal/flags/tracing");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not infer Playwright from CI or non-exact flag values", () => {
+    vi.stubEnv("CI", "true");
+    vi.stubEnv("IN_PLAYWRIGHT", "1");
+    vi.stubEnv("VITE_PLAYWRIGHT", "TRUE");
+    expect(svelteLens()).toHaveLength(3);
+  });
+
+  it.each(["production", "development"])(
+    "never emits Lens instrumentation during a real Vite build in %s mode",
+    async (mode) => {
+      const root = fileURLToPath(new URL("./fixtures/production", import.meta.url));
+      const result = await build({
+        root,
+        mode,
+        configFile: false,
+        logLevel: "silent",
+        plugins: [svelteLens(), svelte()],
+        build: {
+          write: false,
+          minify: false,
+        },
+      });
+
+      if (!Array.isArray(result) && !("output" in result)) {
+        throw new Error("Expected an in-memory Vite build output");
+      }
+      const builds = Array.isArray(result) ? result : [result];
+      const javascript = builds
+        .flatMap((output) => {
+          if (!("output" in output)) throw new Error("Unexpected Vite watcher result");
+          return output.output;
+        })
+        .filter((output) => output.type === "chunk")
+        .map((output) => output.code)
+        .join("\n");
+
+      expect(javascript.length).toBeGreaterThan(0);
+      expect(javascript).toContain("Count ");
+      for (const forbidden of [
+        "svelte-lens",
+        "__SVELTE_LENS__",
+        "__svelte_lens_",
+        "svelte-lens:component",
+        "svelte-lens:end",
+        "svelte-lens:runtime",
+        "svelte-lens:rune-object",
+        "svelte/internal/flags/tracing",
+        "beginComponent({name:",
+        ".registerEffect?.(",
+        ".registerRuneObject?.(",
+        ".installRuntime?.(",
+      ]) {
+        expect(javascript, `production output contained ${forbidden}`).not.toContain(forbidden);
+      }
+    },
+  );
 
   it("preserves original Svelte locations through a real Vite transform", async () => {
     const root = fileURLToPath(new URL("../../../examples/playground", import.meta.url));

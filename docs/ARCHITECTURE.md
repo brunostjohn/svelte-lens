@@ -6,6 +6,7 @@ Svelte 5 development page
        ├─ reads element.__svelte_meta
        ├─ optional window.__SVELTE_LENS__ enhancer API
        ├─ guarded Svelte dev-runtime effect graph adapter
+       ├─ weak rune-object registry with lazy field reads
        ├─ picker/highlighter and bounded checkpoints
        └─ window.postMessage
             ↓
@@ -39,7 +40,9 @@ That is enough for source mapping, call-stack-derived component/block trees, DOM
 
 It is not a component lifecycle/state protocol. The Vite enhancer establishes that missing seam explicitly. Its pre pass parses each component into a binding plan but returns the original `.svelte` bytes unchanged. After Svelte compiles the component, the post pass inserts compiled-aware descriptor closures and marks the `$.pop(...)` boundary so the MAIN-world hook can associate synchronous DOM metadata with the correct component instance without shifting Svelte source locations.
 
-The page hook is the only layer allowed to know either shape. The transport and panel consume normalized protocol records.
+For named classes in `.svelte.js` and `.svelte.ts`, a separate compiled-module pass identifies the private signals Svelte generated for class-field and constructor runes. It emits shared adapters that accept an instance rather than closing over it. The page hook therefore retains instances only through `WeakRef`, snapshots only source-mapped field metadata, and reads values under a shared serialization budget after an explicit `inspect-rune-object` command. It never crawls a prototype or invokes an accessor to discover state.
+
+The page hook is the only layer allowed to know these shapes. The transport and panel consume normalized protocol records.
 
 ## Effect instrumentation
 
@@ -55,7 +58,7 @@ Explicit nested user effects receive independent records. When Svelte exposes a 
 
 ## Sessions and replay
 
-Each document creates a random `sessionId`. The isolated bridge assigns an increasing `seq` to page events and retains the most recent 256 frames. A panel reconnects with its last `{ sessionId, seq }`, ingests missing frames, and acknowledges the durable cursor. The MV3 worker owns no authoritative data and can be terminated at any time.
+Each document creates a random `sessionId`. The isolated bridge assigns an increasing `seq` to page events and retains at most 256 frames under an 8 MiB ceiling. A panel reconnects with its last `{ sessionId, seq }`, ingests missing frames, and acknowledges the durable cursor. The MV3 worker owns no authoritative data and can be terminated at any time.
 
 When the ring cannot satisfy a cursor, the panel receives an explicit `gap`; it never displays an apparently gapless trace with silently missing frames.
 
@@ -65,7 +68,7 @@ The MAIN-world hook is installed at `document_start`, but heavy capture is off b
 
 While idle, the optional compiler enhancer can still register component descriptors and effect sites during their synchronous render boundary. Effect, cleanup, and error counters continue to advance, but dependencies and trace receipts are not captured. This preserves mounted-instance identity and honest totals without continuously reading state, scanning the document, or retaining checkpoints. Total versus captured-run counts expose omitted or synchronously overlapped runs. When recording resumes, the hook samples the then-current graph as a fresh baseline; later `before` previews are relative to that point and do not pretend to explain changes or runs that occurred while capture was off. A receipt uses `capture-gap` when an exact baseline cannot be established safely, including overlapping synchronous finalization.
 
-Detailed effect recording dynamically imports Svelte's development tracing flag so creation and update stacks are available. Svelte exposes no inverse operation. After the first activation, Svelte's own write-stack bookkeeping therefore remains enabled until the inspected page reloads; pausing or closing Lens still stops Lens observers, serialization, receipts, snapshots, and retention.
+Detailed effect recording deliberately does not enable Svelte's development tracing flag because Svelte exposes no inverse operation and the flag adds stack capture to every state write until reload. Lens derives why-rerun evidence from bounded dependency identity, write versions, and value previews; user-authored `$inspect.trace` remains untouched.
 
 ## Security and performance
 
@@ -78,6 +81,8 @@ Detailed effect recording dynamically imports Svelte's development tracing flag 
 - Regular snapshots never read layout geometry; only picker/highlight operations call `getClientRects()`.
 - Component descriptors are released through public `onDestroy`; failed initialization uses an explicit abort path, and stale DOM references are weak or pruned.
 - Effect dependency values use the same bounded preview serializer; live signal and reaction objects never cross the page boundary.
+- Rune-object snapshots contain metadata only. Explicit inspection reads at most 64 compiler-known fields under one 2,000-node/250,000-character budget; the registry is capped at 1,000 weakly held instances.
+- Checkpoints are evicted oldest-first after 12 per component, 256 per page, 16 MiB total, or 100,000 retained nodes. Each checkpoint has independent 512 KiB / 2,000-entry / 2,000-node limits, so leaving DevTools open cannot grow history without bound.
 - Dependency traversal reads only a bounded prefix and retains at most 60 graph nodes. Runtime capacity is 200 effects per component and 1,000 per page. Snapshot and trace compaction preserve totals, source identity, errors, and omission flags so bounds cannot appear as complete evidence.
 - Direct proxy objects and arrays are restored by mutating the existing proxy identity. Compiler-optimized direct primitives and `$state.raw` values, and non-plain direct values, are marked read-only rather than reporting a successful replacement that cannot notify existing subscribers.
 
@@ -85,4 +90,4 @@ Detailed effect recording dynamically imports Svelte's development tracing flag 
 
 `__svelte_meta`, the compiled internal call spelling, and the dev reaction fields used for effect graphs are development internals, not public Svelte APIs. All are feature-detected, shape-guarded, and isolated. Exact effect graph capture is enabled for Svelte 5.39 or newer development output; an unsupported version or changed private shape degrades to unavailable dependency detail instead of throwing into the host application. Transform tests compile representative Svelte 5 components so changes in compiler output fail close to the adapter.
 
-The Vite enhancer transforms `.svelte` components only. It does not instrument rune modules such as `.svelte.ts` or `.svelte.js`, and production builds remain untouched unless a caller explicitly changes the plugin's development-only default.
+The Vite enhancer transforms `.svelte` components plus named rune-bearing classes in `.svelte.ts` and `.svelte.js`. All passes share the same fail-closed dev-server gate; production and preview builds remain untouched.

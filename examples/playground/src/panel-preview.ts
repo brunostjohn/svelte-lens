@@ -15,7 +15,7 @@ const events: PageEvent[] = [
     payload: {
       svelteVersion: '5.56.9',
       mode: 'dev',
-      capabilities: { inspect: true, picker: true, trace: true, state: true, timeTravel: true, effects: true }
+      capabilities: { inspect: true, picker: true, trace: true, state: true, timeTravel: true, effects: true, runeObjects: true }
     }
   },
   {
@@ -142,7 +142,20 @@ const events: PageEvent[] = [
             }]
           }
         }
-      ]
+      ],
+      runeObjects: [{
+        id: 'rune-object:counter-store:1',
+        name: 'CounterStore',
+        file: 'src/lib/CounterStore.svelte.ts',
+        source: { file: 'src/lib/CounterStore.svelte.ts', line: 3, column: 0 },
+        ownerComponentId: 'counter-1',
+        fields: [
+          { name: 'count', kind: 'state', source: { file: 'src/lib/CounterStore.svelte.ts', line: 4, column: 2 } },
+          { name: 'doubled', kind: 'derived', source: { file: 'src/lib/CounterStore.svelte.ts', line: 5, column: 2 } }
+        ],
+        totalFields: 2,
+        truncated: false
+      }]
     }
   },
   {
@@ -161,6 +174,15 @@ const events: PageEvent[] = [
   }
 ];
 
+let sequence = events.length;
+
+function emitPreviewEvent(event: PageEvent) {
+  sequence++;
+  for (const listener of messageListeners) {
+    listener({ v: 1, kind: 'frame', sessionId: 'preview-session', seq: sequence, event });
+  }
+}
+
 const port = {
   name: 'svelte-lens/panel:1',
   onMessage: {
@@ -174,15 +196,49 @@ const port = {
     }
   },
   postMessage(message: PortMessage) {
-    if (message.kind !== 'panel-ready' || sent) return;
-    sent = true;
-    queueMicrotask(() => {
-      events.forEach((event, index) => {
-        for (const listener of messageListeners) {
-          listener({ v: 1, kind: 'frame', sessionId: 'preview-session', seq: index + 1, event });
-        }
+    if (message.kind === 'panel-ready' && !sent) {
+      sent = true;
+      queueMicrotask(() => {
+        events.forEach((event, index) => {
+          for (const listener of messageListeners) {
+            listener({ v: 1, kind: 'frame', sessionId: 'preview-session', seq: index + 1, event });
+          }
+        });
       });
-    });
+      return;
+    }
+    if (message.kind === 'command' && message.command.kind === 'inspect-rune-object') {
+      const { requestId, objectId } = message.command;
+      queueMicrotask(() => {
+        if (objectId !== 'rune-object:counter-store:1') {
+          emitPreviewEvent({
+            type: 'command-result',
+            payload: { requestId, ok: false, error: 'Rune object is no longer available' }
+          });
+          return;
+        }
+        emitPreviewEvent({
+          type: 'command-result',
+          payload: {
+            requestId,
+            ok: true,
+            data: {
+            id: objectId,
+            name: 'CounterStore',
+            file: 'src/lib/CounterStore.svelte.ts',
+            source: { file: 'src/lib/CounterStore.svelte.ts', line: 3, column: 0 },
+            ownerComponentId: 'counter-1',
+            fields: {
+              count: { kind: 'state', source: { file: 'src/lib/CounterStore.svelte.ts', line: 4, column: 2 }, value: 5 },
+              doubled: { kind: 'derived', source: { file: 'src/lib/CounterStore.svelte.ts', line: 5, column: 2 }, value: 10 }
+            },
+            totalFields: 2,
+            truncated: false
+            }
+          }
+        });
+      });
+    }
   },
   disconnect() {
     for (const listener of disconnectListeners) listener();

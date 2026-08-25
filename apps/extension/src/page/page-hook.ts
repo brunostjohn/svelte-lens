@@ -5,6 +5,7 @@ import {
   type LensRect,
   type PageCommand,
   type PageEvent,
+  type RuneObjectSummary,
   type SnapshotNode,
   type SourceLocation,
   type TimeTravelFailure,
@@ -20,24 +21,48 @@ const MAX_TRACE_DETAIL_JSON_NODES = 8_000;
 const MAX_TRACE_DETAIL_JSON_CHARS = 100_000;
 const MAX_TRACE_HISTORY_JSON_CHARS = 8_000_000;
 const MAX_TRACE_BATCH_JSON_CHARS = 1_500_000;
-const MAX_CHECKPOINTS = 40;
+const MAX_CHECKPOINTS = 12;
+const MAX_RETAINED_CHECKPOINTS = 256;
+const MAX_LIVE_BASELINES = 64;
+const MAX_RETAINED_CHECKPOINT_NODES = 100_000;
+const MAX_RETAINED_CHECKPOINT_BYTES = 16 * 1024 * 1024;
+const MAX_CHECKPOINT_NODES = 2_000;
+const MAX_CHECKPOINT_ENTRIES = 2_000;
+const MAX_CHECKPOINT_BYTES = 512 * 1024;
+const MAX_CHECKPOINT_BINARY_BYTES = 256 * 1024;
+const MAX_CHECKPOINT_ARRAY_LENGTH = 100_000;
+const MAX_CHECKPOINT_CAPTURES_PER_FRAME = 32;
 const MAX_EFFECTS = 1_000;
 const MAX_EFFECTS_PER_COMPONENT = 200;
 const MAX_EFFECT_DEPENDENCIES = 60;
 const MAX_EFFECT_DEPENDENCY_DEPTH = 8;
 const MAX_EFFECT_RUNS = 20;
 const MAX_EFFECT_RUNTIMES = 8;
-const MAX_RECTS = 64;
+const MAX_RUNE_OBJECTS = 1_000;
+const MAX_RUNE_FIELDS = 64;
+const MAX_RUNE_OBJECT_SUMMARIES = 250;
+const MAX_RUNE_SUMMARY_FIELDS = 2_000;
+const MAX_RUNE_SUMMARY_CHARS = 250_000;
+const MAX_RUNE_INSPECT_NODES = 2_000;
+const MAX_RUNE_INSPECT_CHARS = 250_000;
+const MAX_RUNE_NAME_CHARS = 512;
+const MAX_RUNE_FILE_CHARS = 4_096;
+const MAX_RUNE_FIELD_NAME_CHARS = 512;
+const MAX_RECTS = 32;
+const MAX_HIGHLIGHT_ELEMENTS = 256;
+const MAX_OBSERVED_ROOTS = 512;
+const MAX_MUTATION_CLAIM_ELEMENTS = 256;
 const MAX_PREVIEW_DEPTH = 5;
 const MAX_PREVIEW_ITEMS = 80;
 const MAX_PREVIEW_STRING = 4_096;
 const MAX_CLONE_DEPTH = 64;
-const MAX_CLONE_NODES = 5_000;
 const MAX_STACK_DEPTH = 100;
 const MAX_SNAPSHOT_JSON_NODES = 50_000;
 const MAX_SNAPSHOT_JSON_CHARS = 1_000_000;
 const MAX_SNAPSHOT_NODE_JSON_NODES = 4_000;
 const MAX_SNAPSHOT_NODE_JSON_CHARS = 80_000;
+const SNAPSHOT_QUIET_MS = 120;
+const SNAPSHOT_MAX_WAIT_MS = 500;
 const DANGEROUS_PATH_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
 interface DevStackEntry {
@@ -84,6 +109,44 @@ interface ComponentDescriptor {
   derived: Record<string, ReadAdapter>;
 }
 
+interface RuneFieldAdapter {
+  kind: 'state' | 'derived';
+  source: SourceLocation;
+  get(target: object): unknown;
+}
+
+interface RuneObjectDescriptor {
+  name: string;
+  file: string;
+  source: SourceLocation;
+  fields: Record<string, RuneFieldAdapter>;
+  totalFields: number;
+  truncated: boolean;
+}
+
+interface NormalizedRuneField {
+  name: string;
+  kind: 'state' | 'derived';
+  source: SourceLocation;
+  get(target: object): unknown;
+}
+
+interface NormalizedRuneDescriptor {
+  name: string;
+  file: string;
+  source: SourceLocation;
+  fields: NormalizedRuneField[];
+  totalFields: number;
+  truncated: boolean;
+}
+
+interface RuneObjectRecord {
+  id: string;
+  ownerComponentId: string | null;
+  target: WeakRef<object>;
+  descriptor: NormalizedRuneDescriptor;
+}
+
 interface EffectDescriptor {
   siteId: string;
   componentId: string | null;
@@ -94,7 +157,6 @@ interface EffectDescriptor {
 interface EffectRuntimeAdapter {
   activeEffect: unknown;
   untrack: <Value>(read: () => Value) => Value;
-  enableTracing?: () => unknown;
 }
 
 type EffectRuntimeResolver = () => EffectRuntimeAdapter | null;
@@ -183,6 +245,7 @@ interface SvelteLensHook {
   replaceStateInPlace(target: unknown, replacement: unknown): void;
   installRuntime(resolve: EffectRuntimeResolver): void;
   registerEffect(descriptor: EffectDescriptor, callback: unknown): unknown;
+  registerRuneObject(target: object, descriptor: RuneObjectDescriptor): string | null;
 }
 
 interface StoredValue {
@@ -195,6 +258,8 @@ interface StoredState {
   values: Map<string, StoredValue>;
   restorable: boolean;
   reason?: string;
+  retainedNodes: number;
+  retainedBytes: number;
 }
 
 interface Checkpoint extends StoredState {
@@ -230,6 +295,8 @@ interface CloneResult {
 
 interface CloneBudget {
   nodes: number;
+  entries: number;
+  bytes: number;
   seen: Map<object, unknown>;
 }
 
@@ -353,13 +420,19 @@ function bootstrap(): void {
   const traceBatch: TraceRecord[] = [];
   const traceJsonSizes = new WeakMap<TraceRecord, number>();
   const liveBaselines = new Map<string, StoredState>();
+  const retainedCheckpoints: Array<{ componentId: string; checkpoint: Checkpoint }> = [];
   const effectRecords = new Map<string, EffectRecord>();
   const omittedEffectsByComponent = new Map<string, number>();
   const effectByReaction = new WeakMap<object, EffectRecord>();
   const signalIds = new WeakMap<object, string>();
+  const runeObjectsByTarget = new WeakMap<object, RuneObjectRecord>();
+  const runeObjects = new Map<string, RuneObjectRecord>();
+  const normalizedRuneDescriptors = new WeakMap<object, NormalizedRuneDescriptor>();
   const runtimeResolvers: EffectRuntimeResolver[] = [];
   const runtimeUntracks = new WeakSet<Function>();
-  const tracingEnabledRuntimes = new WeakSet<Function>();
+  const runeFinalizer = typeof FinalizationRegistry === 'function'
+    ? new FinalizationRegistry<string>((id) => runeObjects.delete(id))
+    : null;
 
   let componentCounter = 0;
   let elementCounter = 0;
@@ -367,8 +440,16 @@ function bootstrap(): void {
   let traceCounter = 0;
   let traceHistoryJsonChars = 0;
   let checkpointCounter = 0;
+  let checkpointCaptureCount = 0;
+  let checkpointBudgetTimer: ReturnType<typeof setTimeout> | null = null;
+  let retainedCheckpointNodes = 0;
+  let retainedCheckpointBytes = 0;
+  let liveBaselineNodes = 0;
+  let liveBaselineBytes = 0;
   let effectCounter = 0;
   let signalCounter = 0;
+  let runeObjectCounter = 0;
+  let runeCapacityMisses = 0;
   let timelineCursor = 0;
   let snapshotRevision = 0;
   let connected = false;
@@ -376,14 +457,20 @@ function bootstrap(): void {
   let pickerActive = false;
   let timelineMode: 'live' | 'travel' | 'restoring' = 'live';
   let selectedHighlight: string | null = null;
+  let revealHighlight: string | null = null;
   let recentCause: { id: string; at: number } | null = null;
   let traceFlushQueued = false;
-  let reconcileQueued = false;
+  let reconcileFrame: number | null = null;
+  let reconcileDirty = true;
   let snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  let snapshotQueuedAt = 0;
+  let helloQueued = false;
   let lastHelloSignature = '';
   let overlay: Overlay | null = null;
   let overlayRepaintFrame: number | null = null;
   let pickerFrame: number | null = null;
+  let highlightFrame: number | null = null;
+  let pendingHighlight: { componentId: string | null; reveal: boolean } | null = null;
   let pendingPickerElement: Element | null = null;
   let lastPickerId: string | null = null;
   let lastPickerRectsKey: string | null = null;
@@ -403,7 +490,8 @@ function bootstrap(): void {
     canReplaceStateInPlace,
     replaceStateInPlace,
     installRuntime,
-    registerEffect
+    registerEffect,
+    registerRuneObject
   };
 
   const sentinel: RuntimeSentinel = {
@@ -427,6 +515,9 @@ function bootstrap(): void {
       pageWindow.removeEventListener('resize', onViewportChange);
       if (overlayRepaintFrame !== null) pageWindow.cancelAnimationFrame(overlayRepaintFrame);
       if (pickerFrame !== null) pageWindow.cancelAnimationFrame(pickerFrame);
+      if (highlightFrame !== null) pageWindow.cancelAnimationFrame(highlightFrame);
+      if (reconcileFrame !== null) pageWindow.cancelAnimationFrame(reconcileFrame);
+      if (checkpointBudgetTimer !== null) clearTimeout(checkpointBudgetTimer);
       if (snapshotTimer) clearTimeout(snapshotTimer);
       restoreCursor();
       overlay?.host.remove();
@@ -459,26 +550,144 @@ function bootstrap(): void {
       if (!isEffectRuntimeAdapter(candidate) || runtimeUntracks.has(candidate.untrack)) return;
       runtimeUntracks.add(candidate.untrack);
       runtimeResolvers.push(resolve);
-      if (recording) enableRuntimeTracing();
-      emitHello();
+      scheduleHello();
     } catch {
       // A mismatched private runtime adapter must never affect the inspected app.
     }
   }
 
-  function enableRuntimeTracing(): void {
-    for (const resolve of runtimeResolvers) {
-      try {
-        const adapter = resolve();
-        if (!isEffectRuntimeAdapter(adapter)) continue;
-        const enable = adapter?.enableTracing;
-        if (typeof enable !== 'function' || tracingEnabledRuntimes.has(adapter.untrack)) continue;
-        tracingEnabledRuntimes.add(adapter.untrack);
-        const result = enable();
-        void Promise.resolve(result).catch(() => tracingEnabledRuntimes.delete(adapter.untrack));
-      } catch {
-        // Tracing stacks are optional; lifecycle and dependency capture continue.
+  function registerRuneObject(target: object, candidate: RuneObjectDescriptor): string | null {
+    try {
+      if (!isObjectValue(target) || !isObjectValue(candidate)) return null;
+      const existing = runeObjectsByTarget.get(target);
+      const descriptor = normalizeRuneDescriptor(candidate);
+      if (!descriptor) return null;
+      if (existing) {
+        if (existing.descriptor !== descriptor) {
+          existing.descriptor = mergeRuneDescriptors(existing.descriptor, descriptor);
+          existing.ownerComponentId ??= findActiveParent();
+        }
+        return existing.id;
       }
+      if (runeObjects.size >= MAX_RUNE_OBJECTS) {
+        // Do not turn a large route mount into O(instances × registry-size)
+        // WeakRef scans. Finalization removes most entries; a bounded periodic
+        // recheck makes space when finalizers are delayed or unavailable.
+        runeCapacityMisses++;
+        if (runeCapacityMisses % 256 !== 0) return null;
+        pruneRuneObjects();
+        if (runeObjects.size >= MAX_RUNE_OBJECTS) return null;
+      }
+      runeCapacityMisses = 0;
+
+      const id = `rune:${sessionId.slice(0, 8)}:${++runeObjectCounter}`;
+      const record: RuneObjectRecord = {
+        id,
+        ownerComponentId: findActiveParent(),
+        target: new WeakRef(target),
+        descriptor
+      };
+      runeObjectsByTarget.set(target, record);
+      runeObjects.set(id, record);
+      runeFinalizer?.register(target, id);
+      scheduleHello();
+      return id;
+    } catch {
+      // Instrumentation must never make constructing an application object fail.
+      return null;
+    }
+  }
+
+  function normalizeRuneDescriptor(candidate: object): NormalizedRuneDescriptor | null {
+    const cached = normalizedRuneDescriptors.get(candidate);
+    if (cached) return cached;
+    const name = readDataProperty(candidate, 'name');
+    const file = readDataProperty(candidate, 'file');
+    const source = normalizeRuneSource(readDataProperty(candidate, 'source'));
+    const fieldRecord = readDataProperty(candidate, 'fields');
+    if (
+      typeof name !== 'string' || name.length === 0 || name.length > MAX_RUNE_NAME_CHARS ||
+      typeof file !== 'string' || file.length === 0 || file.length > MAX_RUNE_FILE_CHARS ||
+      !source || !isObjectValue(fieldRecord)
+    ) return null;
+
+    let keys: string[];
+    try {
+      keys = Object.keys(fieldRecord).slice(0, MAX_RUNE_FIELDS);
+    } catch {
+      return null;
+    }
+    const fields: NormalizedRuneField[] = [];
+    for (const key of keys) {
+      if (key.length === 0 || key.length > MAX_RUNE_FIELD_NAME_CHARS) continue;
+      const adapter = readDataProperty(fieldRecord, key);
+      if (!isObjectValue(adapter)) continue;
+      const kind = readDataProperty(adapter, 'kind');
+      const fieldSource = normalizeRuneSource(readDataProperty(adapter, 'source'));
+      const get = readDataProperty(adapter, 'get');
+      if ((kind !== 'state' && kind !== 'derived') || !fieldSource || typeof get !== 'function') continue;
+      fields.push({ name: key, kind, source: fieldSource, get: get as (target: object) => unknown });
+    }
+    if (fields.length === 0) return null;
+    const declaredTotal = readDataProperty(candidate, 'totalFields');
+    const totalFields = typeof declaredTotal === 'number' && Number.isSafeInteger(declaredTotal) && declaredTotal >= 0
+      ? declaredTotal
+      : fields.length;
+    const descriptor: NormalizedRuneDescriptor = {
+      name,
+      file,
+      source,
+      fields,
+      totalFields: Math.max(totalFields, fields.length),
+      truncated: readDataProperty(candidate, 'truncated') === true || totalFields > fields.length
+    };
+    normalizedRuneDescriptors.set(candidate, descriptor);
+    return descriptor;
+  }
+
+  function mergeRuneDescriptors(
+    base: NormalizedRuneDescriptor,
+    extension: NormalizedRuneDescriptor
+  ): NormalizedRuneDescriptor {
+    const baseNames = new Set(base.fields.map((field) => field.name));
+    const extensionNames = new Set(extension.fields.map((field) => field.name));
+    const collisions = new Set([...baseNames].filter((name) => extensionNames.has(name)));
+    const fields = [
+      ...base.fields.map((field) => ({
+        ...field,
+        name: collisions.has(field.name) ? `${base.name}.${field.name}` : field.name
+      })),
+      ...extension.fields.map((field) => ({
+        ...field,
+        name: collisions.has(field.name) ? `${extension.name}.${field.name}` : field.name
+      }))
+    ].slice(0, MAX_RUNE_FIELDS);
+    return {
+      name: extension.name,
+      file: extension.file,
+      source: copySource(extension.source),
+      fields,
+      totalFields: base.totalFields + extension.totalFields,
+      truncated: base.truncated || extension.truncated ||
+        base.totalFields + extension.totalFields > fields.length
+    };
+  }
+
+  function normalizeRuneSource(value: unknown): SourceLocation | null {
+    if (!isObjectValue(value)) return null;
+    const file = readDataProperty(value, 'file');
+    const line = readDataProperty(value, 'line');
+    const column = readDataProperty(value, 'column');
+    return (
+      typeof file === 'string' && file.length > 0 && file.length <= MAX_RUNE_FILE_CHARS &&
+      typeof line === 'number' && Number.isSafeInteger(line) && line >= 0 &&
+      typeof column === 'number' && Number.isSafeInteger(column) && column >= 0
+    ) ? { file, line, column } : null;
+  }
+
+  function pruneRuneObjects(): void {
+    for (const [id, record] of runeObjects) {
+      if (record.target.deref() === undefined) runeObjects.delete(id);
     }
   }
 
@@ -604,7 +813,10 @@ function bootstrap(): void {
     const runIndex = record.runCount;
     const phase = runIndex === 1 ? 'initial' : 'rerun';
     const captureEnabled = recording;
-    const runtime = findActiveEffectRuntime();
+    // Resolving Svelte's private active reaction is useful only while the panel
+    // is recording. Keep the always-installed wrapper nearly transparent when
+    // DevTools is closed or recording is paused.
+    const runtime = captureEnabled ? findActiveEffectRuntime() : null;
     const effect = runtime?.effect ?? null;
     if (effect) bindEffectReaction(record, effect);
     if (runtime) record.runtimeAdapter = runtime.adapter;
@@ -1105,7 +1317,7 @@ function bootstrap(): void {
       record.recentRuns.splice(0, record.recentRuns.length - MAX_EFFECT_RUNS);
     }
     scheduleSnapshot();
-    emitHello();
+    scheduleHello();
   }
 
   function dependencyDetail(dependency: CapturedDependency): JsonValue {
@@ -1234,9 +1446,11 @@ function bootstrap(): void {
   function beginComponent(candidate: ComponentDescriptor): string | null {
     try {
       if (!isDescriptor(candidate) || components.size >= MAX_COMPONENTS) return null;
-      ensureObserver(recording);
-      const activeParentId = findActiveParent();
-      drainPendingMutations(activeParentId ? components.get(activeParentId) : undefined);
+      if (recording) {
+        ensureObserver(true);
+        const activeParentId = findActiveParent();
+        drainPendingMutations(activeParentId ? components.get(activeParentId) : undefined);
+      }
       const id = `cmp:${sessionId.slice(0, 8)}:${++componentCounter}`;
       const parentId = findActiveParent();
       const record: ComponentRecord = {
@@ -1261,7 +1475,7 @@ function bootstrap(): void {
         scheduleReconcile();
         scheduleSnapshot();
       }
-      emitHello();
+      scheduleHello();
       return id;
     } catch {
       return null;
@@ -1344,9 +1558,10 @@ function bootstrap(): void {
       effectCount: effectIds.length
     });
     for (const effectId of effectIds) removeEffectRecord(effectId);
+    releaseComponentCheckpoints(record);
     components.delete(id);
     omittedEffectsByComponent.delete(id);
-    if (timelineMode === 'live') liveBaselines.delete(id);
+    if (timelineMode === 'live') releaseLiveBaseline(id);
     if (record.invocationEntry && entryOwners.get(record.invocationEntry) === id) {
       entryParentHints.set(record.invocationEntry, record.parentId);
       entryOwners.delete(record.invocationEntry);
@@ -1356,12 +1571,13 @@ function bootstrap(): void {
     for (const element of record.elements) {
       if (elementOwners.get(element) === id) elementOwners.delete(element);
     }
+    if (pendingHighlight?.componentId === id) cancelScheduledHighlight();
     if (selectedHighlight === id) clearHighlight();
     if (recording) {
       scheduleReconcile();
       scheduleSnapshot();
     }
-    emitHello();
+    scheduleHello();
   }
 
   function abortComponent(id: string | null, error?: unknown): void {
@@ -1379,9 +1595,10 @@ function bootstrap(): void {
       error: effectErrorDetail(error)
     });
     for (const effectId of effectIds) removeEffectRecord(effectId);
+    releaseComponentCheckpoints(record);
     components.delete(id);
     omittedEffectsByComponent.delete(id);
-    liveBaselines.delete(id);
+    releaseLiveBaseline(id);
     if (record.invocationEntry && entryOwners.get(record.invocationEntry) === id) {
       entryParentHints.set(record.invocationEntry, record.parentId);
       entryOwners.delete(record.invocationEntry);
@@ -1391,6 +1608,7 @@ function bootstrap(): void {
     for (const element of record.elements) {
       if (elementOwners.get(element) === id) elementOwners.delete(element);
     }
+    if (pendingHighlight?.componentId === id) cancelScheduledHighlight();
     if (selectedHighlight === id) clearHighlight();
     if (recording) {
       scheduleReconcile();
@@ -1398,7 +1616,7 @@ function bootstrap(): void {
     } else if (activeComponents.length === 0) {
       stopObserver();
     }
-    emitHello();
+    scheduleHello();
   }
 
   function findActiveParent(): string | null {
@@ -1459,12 +1677,15 @@ function bootstrap(): void {
         recording = command.enabled;
         setInteractionListeners(recording);
         if (recording) {
-          enableRuntimeTracing();
           ensureObserver(true);
           needsFullScan = true;
           for (const effect of effectRecords.values()) resumeEffectCapture(effect);
+          let capturedBaselines = 0;
           for (const record of components.values()) {
-            const checkpoint = hasWritableState(record) ? captureCheckpoint(record, 'init') : null;
+            const checkpoint = hasWritableState(record) && capturedBaselines < MAX_RETAINED_CHECKPOINTS
+              ? captureCheckpoint(record, 'init')
+              : null;
+            if (checkpoint) capturedBaselines++;
             pushTrace('mount', record.id, checkpointTraceDetail('baseline', checkpoint));
           }
           scheduleReconcile();
@@ -1479,7 +1700,10 @@ function bootstrap(): void {
         else stopPicker(true);
         return;
       case 'highlight':
-        highlightComponent(command.componentId, command.reveal ?? false);
+        scheduleHighlight(command.componentId, command.reveal ?? false);
+        return;
+      case 'inspect-rune-object':
+        inspectRuneObject(command);
         return;
       case 'set-value':
         setValue(command);
@@ -1521,13 +1745,23 @@ function bootstrap(): void {
         trace: metadata || enhanced,
         state,
         timeTravel,
-        effects: runtimeResolvers.length > 0 || effectRecords.size > 0
+        effects: runtimeResolvers.length > 0 || effectRecords.size > 0,
+        runeObjects: true
       }
     } as const;
     const signature = JSON.stringify(payload);
     if (!force && signature === lastHelloSignature) return;
     lastHelloSignature = signature;
     send({ type: 'hello', payload });
+  }
+
+  function scheduleHello(): void {
+    if (helloQueued) return;
+    helloQueued = true;
+    queueMicrotask(() => {
+      helloQueued = false;
+      if (host[PAGE_HOOK_KEY] === sentinel) emitHello();
+    });
   }
 
   function readSvelteVersion(): string | null {
@@ -1553,42 +1787,74 @@ function bootstrap(): void {
   }
 
   function emitSnapshot(requestId?: string): void {
-    if (requestId !== undefined) needsFullScan = true;
-    reconcileDom();
+    if (requestId !== undefined) {
+      cancelScheduledSnapshot();
+      needsFullScan = true;
+      reconcileDirty = true;
+    }
+    if (reconcileDirty) {
+      cancelScheduledReconcile();
+      reconcileDom();
+      reconcileDirty = false;
+    }
     const nodes = buildSnapshotNodes();
+    const runeObjectSummaries = buildRuneObjectSummaries();
     const payload = {
       revision: ++snapshotRevision,
       capturedAt: Date.now(),
-      nodes
+      nodes,
+      runeObjects: runeObjectSummaries
     } as {
       requestId?: string;
       revision: number;
       capturedAt: number;
       nodes: SnapshotNode[];
+      runeObjects: RuneObjectSummary[];
     };
     if (requestId !== undefined) payload.requestId = requestId;
     send({ type: 'snapshot', payload });
   }
 
   function scheduleSnapshot(): void {
-    if (!recording || !connected || snapshotTimer) return;
+    if (!recording || !connected) return;
+    const now = performance.now();
+    if (snapshotQueuedAt === 0) snapshotQueuedAt = now;
+    if (snapshotTimer) clearTimeout(snapshotTimer);
+    const elapsed = Math.max(0, now - snapshotQueuedAt);
+    const delay = Math.max(0, Math.min(SNAPSHOT_QUIET_MS, SNAPSHOT_MAX_WAIT_MS - elapsed));
     snapshotTimer = setTimeout(() => {
       snapshotTimer = null;
+      snapshotQueuedAt = 0;
       emitSnapshot();
-    }, 50);
+    }, delay);
   }
 
   function scheduleReconcile(): void {
-    if (reconcileQueued) return;
-    reconcileQueued = true;
-    queueMicrotask(() => {
-      reconcileQueued = false;
+    reconcileDirty = true;
+    if (reconcileFrame !== null) return;
+    reconcileFrame = pageWindow.requestAnimationFrame(() => {
+      reconcileFrame = null;
+      if (!reconcileDirty) return;
       reconcileDom();
+      reconcileDirty = false;
       emitHello();
     });
   }
 
+  function cancelScheduledReconcile(): void {
+    if (reconcileFrame === null) return;
+    pageWindow.cancelAnimationFrame(reconcileFrame);
+    reconcileFrame = null;
+  }
+
+  function cancelScheduledSnapshot(): void {
+    if (snapshotTimer) clearTimeout(snapshotTimer);
+    snapshotTimer = null;
+    snapshotQueuedAt = 0;
+  }
+
   function reconcileDom(): void {
+    pruneObservedRoots();
     discoverAnnotatedElements();
     const ordered = Array.from(trackedElements).filter((element) => element.isConnected && readMeta(element));
     const domIndex = new Map<Element, number>();
@@ -1646,7 +1912,7 @@ function bootstrap(): void {
   }
 
   function scanRoot(root: Document | ShadowRoot): void {
-    observedRoots.add(root);
+    if (!rememberObservedRoot(root)) return;
     const all = root.querySelectorAll('*');
     for (let index = 0; index < all.length && trackedElements.size < MAX_ELEMENTS; index++) {
       const element = all[index];
@@ -1665,6 +1931,26 @@ function bootstrap(): void {
     for (const element of trackedElements) {
       if (!element.isConnected) trackedElements.delete(element);
     }
+  }
+
+  function pruneObservedRoots(): void {
+    let removed = false;
+    for (const root of observedRoots) {
+      if (root instanceof ShadowRootCtor && !root.host.isConnected) {
+        observedRoots.delete(root);
+        removed = true;
+      }
+    }
+    if (!removed || !observerStarted) return;
+    observer.disconnect();
+    for (const root of observedRoots) observeRoot(root);
+  }
+
+  function rememberObservedRoot(root: Document | ShadowRoot): boolean {
+    if (observedRoots.has(root)) return true;
+    if (observedRoots.size >= MAX_OBSERVED_ROOTS) return false;
+    observedRoots.add(root);
+    return true;
   }
 
   function inferDelayedComponentParents(
@@ -1902,6 +2188,54 @@ function bootstrap(): void {
       if (current === expected) return true;
     }
     return false;
+  }
+
+  function buildRuneObjectSummaries(): RuneObjectSummary[] {
+    const summaries: RuneObjectSummary[] = [];
+    let remainingFields = MAX_RUNE_SUMMARY_FIELDS;
+    let remainingChars = MAX_RUNE_SUMMARY_CHARS;
+    for (const [id, record] of runeObjects) {
+      if (record.target.deref() === undefined) {
+        runeObjects.delete(id);
+        continue;
+      }
+      const descriptor = record.descriptor;
+      const baseChars = descriptor.name.length + descriptor.file.length + descriptor.source.file.length + 64;
+      if (baseChars > remainingChars) break;
+      remainingChars -= baseChars;
+      const includedFields: NormalizedRuneField[] = [];
+      for (const field of descriptor.fields) {
+        if (includedFields.length >= remainingFields) break;
+        const fieldChars = field.name.length + field.source.file.length + 32;
+        if (fieldChars > remainingChars) break;
+        includedFields.push(field);
+        remainingChars -= fieldChars;
+      }
+      const summary: RuneObjectSummary = {
+        id,
+        name: descriptor.name,
+        file: descriptor.file,
+        source: copySource(descriptor.source),
+        fields: includedFields.map((field) => ({
+          name: field.name,
+          kind: field.kind,
+          source: copySource(field.source)
+        })),
+        totalFields: descriptor.totalFields,
+        truncated: descriptor.truncated || includedFields.length < descriptor.fields.length
+      };
+      if (record.ownerComponentId && components.has(record.ownerComponentId)) {
+        summary.ownerComponentId = record.ownerComponentId;
+      }
+      summaries.push(summary);
+      remainingFields -= includedFields.length;
+      if (
+        summaries.length >= MAX_RUNE_OBJECT_SUMMARIES ||
+        remainingFields <= 0 ||
+        remainingChars <= 0
+      ) break;
+    }
+    return summaries;
   }
 
   function buildSnapshotNodes(): SnapshotNode[] {
@@ -2257,11 +2591,10 @@ function bootstrap(): void {
       if (mutation.type === 'childList') {
         for (const node of mutation.addedNodes) {
           if (isOverlayNode(node)) continue;
-          added += countElements(node);
-          discoverFromNode(node);
+          if (node instanceof ElementCtor) added++;
         }
         for (const node of mutation.removedNodes) {
-          if (!isOverlayNode(node)) removed += countElements(node);
+          if (!isOverlayNode(node) && node instanceof ElementCtor) removed++;
         }
       } else if (mutation.type === 'attributes') {
         attributes++;
@@ -2278,7 +2611,16 @@ function bootstrap(): void {
     if (added || removed || attributes || text) {
       const componentId = owners.size === 1 ? owners.values().next().value as string : undefined;
       pushTrace('dom', componentId, { added, removed, attributes, text });
-      scheduleReconcile();
+      // Attribute and text changes do not alter the component tree. Rebuilding
+      // ownership for those hot-path mutations made route transitions and
+      // animated pages repeatedly scan the whole document.
+      if (added || removed) {
+        // Never traverse added subtrees inside the MutationObserver callback.
+        // Route swaps can insert tens of thousands of nodes at once; the single
+        // scheduled reconciliation owns that document-wide work.
+        needsFullScan = true;
+        scheduleReconcile();
+      }
       scheduleSnapshot();
     }
   }
@@ -2288,35 +2630,44 @@ function bootstrap(): void {
     records: MutationRecord[]
   ): void {
     const file = normalizeFile(record.descriptor.file);
+    let remaining = MAX_MUTATION_CLAIM_ELEMENTS;
     for (const mutation of records) {
       if (mutation.type !== 'childList') continue;
       for (const node of mutation.addedNodes) {
         if (isOverlayNode(node)) continue;
-        for (const element of elementTree(node)) {
+        remaining -= visitElementTree(node, remaining, (element) => {
           const loc = readMeta(element)?.loc;
-          if (!loc || normalizeFile(loc.file) !== file) continue;
+          if (!loc || normalizeFile(loc.file) !== file) return;
           trackedElements.add(element);
           elementOwners.set(element, record.id);
-        }
+        });
+        if (remaining <= 0) return;
       }
     }
   }
 
-  function elementTree(node: Node): Element[] {
-    if (!(node instanceof ElementCtor) || isOverlayNode(node)) return [];
-    return [node, ...Array.from(node.querySelectorAll('*'))];
-  }
-
-  function discoverFromNode(node: Node): void {
-    for (const element of elementTree(node)) {
-      if (isOverlayNode(element)) continue;
-      if (trackedElements.size < MAX_ELEMENTS && readMeta(element)) trackedElements.add(element);
-      const shadow = element.shadowRoot;
-      if (shadow && !observedRoots.has(shadow)) {
-        observeRoot(shadow);
-        scanRoot(shadow);
+  function visitElementTree(
+    node: Node,
+    limit: number,
+    visit: (element: Element) => void
+  ): number {
+    if (!(node instanceof ElementCtor) || isOverlayNode(node) || limit <= 0) return 0;
+    const pending: Element[] = [node];
+    let visited = 0;
+    while (pending.length > 0 && visited < limit) {
+      const element = pending.pop();
+      if (!element || isOverlayNode(element)) continue;
+      visit(element);
+      visited++;
+      for (
+        let child = element.lastElementChild;
+        child && pending.length + visited < limit;
+        child = child.previousElementSibling
+      ) {
+        pending.push(child);
       }
     }
+    return visited;
   }
 
   function configureObserver(full: boolean): void {
@@ -2332,16 +2683,28 @@ function bootstrap(): void {
   }
 
   function stopObserver(): void {
-    if (!observerStarted) return;
-    observer.takeRecords();
-    observer.disconnect();
-    observerStarted = false;
-    observerRecording = false;
+    cancelScheduledReconcile();
+    cancelScheduledSnapshot();
+    if (checkpointBudgetTimer !== null) clearTimeout(checkpointBudgetTimer);
+    checkpointBudgetTimer = null;
+    checkpointCaptureCount = 0;
+    if (observerStarted) {
+      observer.takeRecords();
+      observer.disconnect();
+      observerStarted = false;
+      observerRecording = false;
+    }
+    // Shadow roots are rediscovered by the next bounded full scan. Keeping
+    // detached roots here would retain entire route/HMR subtrees indefinitely.
+    observedRoots.clear();
+    observedRoots.add(document);
+    needsFullScan = true;
+    reconcileDirty = true;
   }
 
   function observeRoot(root: Document | ShadowRoot): void {
     if (root instanceof ShadowRootCtor && isOverlayNode(root.host)) return;
-    observedRoots.add(root);
+    if (!rememberObservedRoot(root)) return;
     if (!observerStarted) return;
     try {
       observer.observe(root, {
@@ -2355,15 +2718,9 @@ function bootstrap(): void {
     }
   }
 
-  function countElements(node: Node): number {
-    if (!(node instanceof ElementCtor)) return 0;
-    return 1 + node.querySelectorAll('*').length;
-  }
-
   function startPicker(): void {
     if (pickerActive) return;
-    needsFullScan = true;
-    reconcileDom();
+    cancelScheduledHighlight();
     pickerActive = true;
     setPickerListeners(true);
     lastPickerId = null;
@@ -2417,7 +2774,8 @@ function bootstrap(): void {
     }
     const componentId = resolveInspectableId(annotated);
     const pickerId = componentId ?? getElementId(annotated);
-    const elements = componentId ? elementsForId(componentId) : [annotated];
+    const cached = componentId ? elementsForId(componentId) : [];
+    const elements = cached.length > 0 ? cached : [annotated];
     const meta = readMeta(annotated);
     const label = labelForId(componentId, annotated);
     const rects = rectsForElements(elements);
@@ -2446,7 +2804,8 @@ function bootstrap(): void {
     event.stopImmediatePropagation();
     const componentId = resolveInspectableId(annotated);
     if (componentId) selectedHighlight = componentId;
-    const elements = componentId ? elementsForId(componentId) : [annotated];
+    const cached = componentId ? elementsForId(componentId) : [];
+    const elements = cached.length > 0 ? cached : [annotated];
     const meta = readMeta(annotated);
     const label = labelForId(componentId, annotated);
     const rects = showOverlay(elements, label);
@@ -2470,20 +2829,42 @@ function bootstrap(): void {
     stopPicker(true);
   }
 
+  function scheduleHighlight(componentId: string | null, reveal: boolean): void {
+    pendingHighlight = { componentId, reveal };
+    if (highlightFrame !== null) return;
+    highlightFrame = pageWindow.requestAnimationFrame(() => {
+      highlightFrame = null;
+      const next = pendingHighlight;
+      pendingHighlight = null;
+      if (next) highlightComponent(next.componentId, next.reveal);
+    });
+  }
+
+  function cancelScheduledHighlight(): void {
+    pendingHighlight = null;
+    if (highlightFrame === null) return;
+    pageWindow.cancelAnimationFrame(highlightFrame);
+    highlightFrame = null;
+  }
+
   function highlightComponent(componentId: string | null, reveal: boolean): void {
     if (!componentId) {
       clearHighlight();
       return;
     }
-    needsFullScan = true;
-    reconcileDom();
+    selectedHighlight = componentId;
+    revealHighlight = reveal ? componentId : null;
     const elements = elementsForId(componentId);
     if (elements.length === 0) {
-      clearHighlight();
+      needsFullScan = true;
+      scheduleReconcile();
+      hideOverlay();
       return;
     }
-    selectedHighlight = componentId;
-    if (reveal) elements[0]?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+    if (revealHighlight === componentId) {
+      revealHighlight = null;
+      elements[0]?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+    }
     showOverlay(elements, labelForId(componentId, elements[0] ?? null));
   }
 
@@ -2492,6 +2873,10 @@ function bootstrap(): void {
     if (elements.length === 0) {
       clearHighlight();
       return;
+    }
+    if (revealHighlight === componentId) {
+      revealHighlight = null;
+      elements[0]?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
     }
     showOverlay(elements, labelForId(componentId, elements[0] ?? null));
   }
@@ -2506,6 +2891,7 @@ function bootstrap(): void {
 
   function clearHighlight(): void {
     selectedHighlight = null;
+    revealHighlight = null;
     hideOverlay();
   }
 
@@ -2553,18 +2939,24 @@ function bootstrap(): void {
   function elementsForId(id: string): Element[] {
     const record = components.get(id);
     if (record) {
-      const elements = new Set<Element>(record.bounds);
-      for (const element of record.elements) elements.add(element);
+      const elements = new Set<Element>();
+      for (const element of record.bounds) {
+        if (element.isConnected) elements.add(element);
+        if (elements.size >= MAX_HIGHLIGHT_ELEMENTS) break;
+      }
+      if (elements.size < MAX_HIGHLIGHT_ELEMENTS) for (const element of record.elements) {
+        if (element.isConnected) elements.add(element);
+        if (elements.size >= MAX_HIGHLIGHT_ELEMENTS) break;
+      }
       const inferred = fallbackElements.get(id);
-      if (inferred) for (const element of inferred) elements.add(element);
-      return connectedElements(elements);
+      if (inferred && elements.size < MAX_HIGHLIGHT_ELEMENTS) for (const element of inferred) {
+        if (element.isConnected) elements.add(element);
+        if (elements.size >= MAX_HIGHLIGHT_ELEMENTS) break;
+      }
+      return Array.from(elements);
     }
-    let elements = fallbackElements.get(id);
-    if (!elements) {
-      buildSnapshotNodes();
-      elements = fallbackElements.get(id);
-    }
-    return elements ? connectedElements(elements) : [];
+    const elements = fallbackElements.get(id);
+    return elements ? boundedConnectedElements(elements, MAX_HIGHLIGHT_ELEMENTS) : [];
   }
 
   function rootEnhancedAncestor(ownerId: string): string | null {
@@ -2597,10 +2989,16 @@ function bootstrap(): void {
     if (id) {
       const record = components.get(id);
       if (record) return record.descriptor.name;
-      for (const tracked of trackedElements) {
-        const meta = readMeta(tracked);
-        for (const entry of innerStackChain(meta?.parent ?? null)) {
+      if (element) {
+        for (const entry of innerStackChain(readMeta(element)?.parent ?? null)) {
           if (getEntryId(entry) === id) return entryName(entry);
+        }
+      } else {
+        for (const tracked of trackedElements) {
+          const meta = readMeta(tracked);
+          for (const entry of innerStackChain(meta?.parent ?? null)) {
+            if (getEntryId(entry) === id) return entryName(entry);
+          }
         }
       }
     }
@@ -2704,6 +3102,7 @@ function bootstrap(): void {
 
   function rectsForElements(elements: Iterable<Element>): LensRect[] {
     const rects: LensRect[] = [];
+    const seen = new Set<string>();
     for (const element of elements) {
       if (!element.isConnected || isOverlayNode(element)) continue;
       try {
@@ -2718,6 +3117,9 @@ function bootstrap(): void {
             continue;
           }
           if (rect.width <= 0 && rect.height <= 0) continue;
+          const key = `${rect.top}:${rect.left}:${rect.width}:${rect.height}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
           rects.push({ top: rect.top, left: rect.left, width: rect.width, height: rect.height });
         }
       } catch {
@@ -2725,6 +3127,51 @@ function bootstrap(): void {
       }
     }
     return rects;
+  }
+
+  function inspectRuneObject(
+    command: Extract<PageCommand, { kind: 'inspect-rune-object' }>
+  ): void {
+    const record = runeObjects.get(command.objectId);
+    const target = record?.target.deref();
+    if (!record || !target) {
+      if (record) runeObjects.delete(record.id);
+      commandError(command.requestId, 'Rune object is no longer available');
+      return;
+    }
+
+    const budget: PreviewBudget = {
+      nodes: MAX_RUNE_INSPECT_NODES,
+      chars: MAX_RUNE_INSPECT_CHARS,
+      seen: new Map(),
+      nextRef: 1
+    };
+    const fields = Object.create(null) as Record<string, JsonValue>;
+    for (const field of record.descriptor.fields) {
+      let value: JsonValue;
+      try {
+        value = previewInner(field.get(target), 0, budget);
+      } catch (error) {
+        value = errorPreview(error);
+      }
+      fields[field.name] = {
+        kind: field.kind,
+        source: sourceJson(field.source),
+        value
+      };
+    }
+    commandOk(command.requestId, {
+      id: record.id,
+      name: record.descriptor.name,
+      file: record.descriptor.file,
+      source: sourceJson(record.descriptor.source),
+      ownerComponentId: record.ownerComponentId && components.has(record.ownerComponentId)
+        ? record.ownerComponentId
+        : null,
+      fields,
+      totalFields: record.descriptor.totalFields,
+      truncated: record.descriptor.truncated
+    });
   }
 
   function setValue(command: Extract<PageCommand, { kind: 'set-value' }>): void {
@@ -2780,24 +3227,30 @@ function bootstrap(): void {
     const failures: TimeTravelFailure[] = [];
     let selections = selectCheckpoints(command, failures);
     if (timelineMode === 'live') {
-      liveBaselines.clear();
+      clearLiveBaselines();
+      let retained = 0;
+      let attempted = 0;
       for (const record of components.values()) {
         if (!hasWritableState(record)) continue;
+        if (attempted++ >= MAX_LIVE_BASELINES || retained >= MAX_LIVE_BASELINES) break;
         const baseline = captureStoredState(record);
-        if (baseline.restorable) liveBaselines.set(record.id, baseline);
+        if (baseline.restorable) {
+          if (!retainLiveBaseline(record.id, baseline)) break;
+          retained++;
+        }
       }
     }
     const unavailable = new Set<string>();
     for (const [record] of selections) {
       if (liveBaselines.has(record.id)) continue;
       const baseline = captureStoredState(record);
-      if (baseline.restorable) {
-        liveBaselines.set(record.id, baseline);
+      if (baseline.restorable && retainLiveBaseline(record.id, baseline)) {
+        // Retained above.
       } else {
         unavailable.add(record.id);
         failures.push({
           componentId: record.id,
-          reason: `Cannot enter time travel without a live baseline: ${baseline.reason ?? 'state is not restorable'}`
+          reason: `Cannot enter time travel without a live baseline: ${baseline.reason ?? 'global live-baseline budget exhausted'}`
         });
       }
     }
@@ -2821,7 +3274,7 @@ function bootstrap(): void {
     const enteredTravel = applied > 0 || rollbackIncomplete;
     if (!enteredTravel) {
       timelineMode = 'live';
-      liveBaselines.clear();
+      clearLiveBaselines();
     }
 
     const reportedFailures = normalizeFailures(failures);
@@ -2852,8 +3305,12 @@ function bootstrap(): void {
     });
     sendTimeTravelResult(requestId, true, applied, reportedFailures);
     if (recording) {
+      let captured = 0;
       for (const record of components.values()) {
-        if (hasWritableState(record)) captureCheckpoint(record, 'live');
+        if (hasWritableState(record) && captured < MAX_RETAINED_CHECKPOINTS) {
+          captureCheckpoint(record, 'live');
+          captured++;
+        }
       }
       scheduleSnapshot();
     }
@@ -2873,7 +3330,7 @@ function bootstrap(): void {
       if (failure) failures.push({ componentId, reason: failure });
       else applied++;
     }
-    liveBaselines.clear();
+    clearLiveBaselines();
     timelineMode = 'live';
     return { failures, applied };
   }
@@ -2960,7 +3417,8 @@ function bootstrap(): void {
   function captureCheckpoint(
     record: ComponentRecord,
     phase: Checkpoint['phase']
-  ): Checkpoint {
+  ): Checkpoint | null {
+    if (!reserveCheckpointCapture()) return null;
     const stored = captureStoredState(record);
     const currentPreview = new Map<string, string>();
     const changes: string[] = [];
@@ -2983,33 +3441,118 @@ function bootstrap(): void {
       phase,
       changes,
       values: stored.values,
-      restorable: stored.restorable
+      restorable: stored.restorable,
+      retainedNodes: stored.retainedNodes,
+      retainedBytes: stored.retainedBytes
     };
     if (stored.reason) checkpoint.reason = stored.reason;
-    record.checkpoints.push(checkpoint);
-    if (record.checkpoints.length > MAX_CHECKPOINTS) {
-      record.checkpoints.splice(0, record.checkpoints.length - MAX_CHECKPOINTS);
-    }
+    retainCheckpoint(record, checkpoint);
     return checkpoint;
+  }
+
+  function reserveCheckpointCapture(): boolean {
+    if (checkpointCaptureCount >= MAX_CHECKPOINT_CAPTURES_PER_FRAME) return false;
+    checkpointCaptureCount++;
+    if (checkpointBudgetTimer === null) {
+      checkpointBudgetTimer = setTimeout(() => {
+        checkpointBudgetTimer = null;
+        checkpointCaptureCount = 0;
+      }, 16);
+    }
+    return true;
+  }
+
+  function retainCheckpoint(record: ComponentRecord, checkpoint: Checkpoint): void {
+    record.checkpoints.push(checkpoint);
+    retainedCheckpoints.push({ componentId: record.id, checkpoint });
+    retainedCheckpointNodes += checkpoint.retainedNodes;
+    retainedCheckpointBytes += checkpoint.retainedBytes;
+
+    while (record.checkpoints.length > MAX_CHECKPOINTS) {
+      const oldest = record.checkpoints[0];
+      if (!oldest) break;
+      releaseCheckpoint(record, oldest);
+    }
+    while (
+      retainedCheckpoints.length > MAX_RETAINED_CHECKPOINTS ||
+      retainedCheckpointNodes > MAX_RETAINED_CHECKPOINT_NODES ||
+      retainedCheckpointBytes > MAX_RETAINED_CHECKPOINT_BYTES
+    ) {
+      const oldest = retainedCheckpoints[0];
+      if (!oldest) break;
+      const owner = components.get(oldest.componentId);
+      if (owner) releaseCheckpoint(owner, oldest.checkpoint);
+      else releaseRetainedCheckpointReference(oldest.checkpoint);
+    }
+  }
+
+  function releaseCheckpoint(record: ComponentRecord, checkpoint: Checkpoint): void {
+    const recordIndex = record.checkpoints.indexOf(checkpoint);
+    if (recordIndex !== -1) record.checkpoints.splice(recordIndex, 1);
+    releaseRetainedCheckpointReference(checkpoint);
+  }
+
+  function releaseRetainedCheckpointReference(checkpoint: Checkpoint): void {
+    const retainedIndex = retainedCheckpoints.findIndex((entry) => entry.checkpoint === checkpoint);
+    if (retainedIndex === -1) return;
+    retainedCheckpoints.splice(retainedIndex, 1);
+    retainedCheckpointNodes = Math.max(0, retainedCheckpointNodes - checkpoint.retainedNodes);
+    retainedCheckpointBytes = Math.max(0, retainedCheckpointBytes - checkpoint.retainedBytes);
+  }
+
+  function releaseComponentCheckpoints(record: ComponentRecord): void {
+    for (const checkpoint of [...record.checkpoints]) releaseCheckpoint(record, checkpoint);
+  }
+
+  function retainLiveBaseline(componentId: string, baseline: StoredState): boolean {
+    if (
+      liveBaselineNodes + baseline.retainedNodes > MAX_RETAINED_CHECKPOINT_NODES ||
+      liveBaselineBytes + baseline.retainedBytes > MAX_RETAINED_CHECKPOINT_BYTES
+    ) {
+      return false;
+    }
+    releaseLiveBaseline(componentId);
+    liveBaselines.set(componentId, baseline);
+    liveBaselineNodes += baseline.retainedNodes;
+    liveBaselineBytes += baseline.retainedBytes;
+    return true;
+  }
+
+  function releaseLiveBaseline(componentId: string): void {
+    const baseline = liveBaselines.get(componentId);
+    if (!baseline) return;
+    liveBaselines.delete(componentId);
+    liveBaselineNodes = Math.max(0, liveBaselineNodes - baseline.retainedNodes);
+    liveBaselineBytes = Math.max(0, liveBaselineBytes - baseline.retainedBytes);
+  }
+
+  function clearLiveBaselines(): void {
+    liveBaselines.clear();
+    liveBaselineNodes = 0;
+    liveBaselineBytes = 0;
   }
 
   function captureStoredState(record: ComponentRecord): StoredState {
     const values = new Map<string, StoredValue>();
     const reasons: string[] = [];
+    const budget = createCloneBudget();
     let writable = 0;
     for (const [name, adapter] of safeEntries(record.descriptor.state)) {
       if (!isWritableStateAdapter(adapter)) continue;
       writable++;
       try {
         const current = adapter.get();
-        const cloned = cloneForStorage(current);
+        const cloned = cloneForStorage(current, budget);
         const stored: StoredValue = {
           value: cloned.value,
           restorable: cloned.ok
         };
         if (cloned.reason) stored.reason = cloned.reason;
         values.set(name, stored);
-        if (!cloned.ok) reasons.push(`${name}: ${cloned.reason ?? 'unsupported value'}`);
+        if (!cloned.ok) {
+          reasons.push(`${name}: ${cloned.reason ?? 'unsupported value'}`);
+          break;
+        }
       } catch (error) {
         const reason = errorMessage(error);
         values.set(name, {
@@ -3018,12 +3561,18 @@ function bootstrap(): void {
           reason
         });
         reasons.push(`${name}: ${reason}`);
+        break;
       }
     }
     if (writable === 0) reasons.push('Component has no writable state bindings');
+    // A partially captured component can never be restored transactionally.
+    // Drop partial clones immediately instead of retaining dead weight.
+    if (reasons.length > 0) values.clear();
     const result: StoredState = {
       values,
-      restorable: writable > 0 && reasons.length === 0
+      restorable: writable > 0 && reasons.length === 0,
+      retainedNodes: reasons.length === 0 ? MAX_CHECKPOINT_NODES - budget.nodes : 0,
+      retainedBytes: reasons.length === 0 ? MAX_CHECKPOINT_BYTES - budget.bytes : 0
     };
     if (reasons.length > 0) result.reason = reasons.join('; ');
     return result;
@@ -3031,6 +3580,7 @@ function bootstrap(): void {
 
   function applyStoredState(record: ComponentRecord, stored: StoredState): string | null {
     if (!stored.restorable) return stored.reason ?? 'Checkpoint is not restorable';
+    const budget = createCloneBudget(2);
     const writes: Array<{
       set(value: unknown): void;
       next: unknown;
@@ -3042,7 +3592,7 @@ function bootstrap(): void {
         return `Writable state binding "${name}" is no longer available`;
       }
       if (!value.restorable) return value.reason ?? `State binding "${name}" is not restorable`;
-      const next = cloneForStorage(value.value);
+      const next = cloneForStorage(value.value, budget);
       if (!next.ok) return next.reason ?? `State binding "${name}" cannot be cloned`;
       let current: unknown;
       try {
@@ -3050,7 +3600,7 @@ function bootstrap(): void {
       } catch (error) {
         return `Could not read current state "${name}": ${errorMessage(error)}`;
       }
-      const previous = cloneForStorage(current);
+      const previous = cloneForStorage(current, budget);
       if (!previous.ok) {
         return previous.reason ?? `Current state binding "${name}" cannot be cloned for rollback`;
       }
@@ -3168,8 +3718,7 @@ function copyEffectDescriptor(value: EffectDescriptor): EffectDescriptor {
 function isEffectRuntimeAdapter(value: unknown): value is EffectRuntimeAdapter {
   return (
     isObject(value) &&
-    typeof value.untrack === 'function' &&
-    (value.enableTracing === undefined || typeof value.enableTracing === 'function')
+    typeof value.untrack === 'function'
   );
 }
 
@@ -3282,6 +3831,10 @@ function isDevStackEntry(value: unknown): value is DevStackEntry {
 }
 
 function copySource(source: SourceLocation): SourceLocation {
+  return { file: source.file, line: source.line, column: source.column };
+}
+
+function sourceJson(source: SourceLocation): JsonValue {
   return { file: source.file, line: source.line, column: source.column };
 }
 
@@ -3709,6 +4262,15 @@ function connectedElements(elements: Iterable<Element>): Element[] {
   return result;
 }
 
+function boundedConnectedElements(elements: Iterable<Element>, limit: number): Element[] {
+  const result: Element[] = [];
+  for (const element of elements) {
+    if (element.isConnected) result.push(element);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
 function preview(value: unknown): JsonValue {
   return previewInner(value, 0, {
     nodes: 2_000,
@@ -3855,13 +4417,27 @@ function previewText(value: string, budget: PreviewBudget, limit = MAX_PREVIEW_S
   return result;
 }
 
-function cloneForStorage(value: unknown): CloneResult {
-  return cloneInner(value, 0, { nodes: MAX_CLONE_NODES, seen: new Map() });
+function createCloneBudget(multiplier = 1): CloneBudget {
+  return {
+    nodes: MAX_CHECKPOINT_NODES * multiplier,
+    entries: MAX_CHECKPOINT_ENTRIES * multiplier,
+    bytes: MAX_CHECKPOINT_BYTES * multiplier,
+    seen: new Map()
+  };
+}
+
+function cloneForStorage(value: unknown, budget = createCloneBudget()): CloneResult {
+  return cloneInner(value, 0, budget);
 }
 
 function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneResult {
-  if (budget.nodes-- <= 0) return cloneFailure('State exceeds the checkpoint node budget');
   if (depth > MAX_CLONE_DEPTH) return cloneFailure('State exceeds the checkpoint depth budget');
+  if (typeof value === 'function') return cloneFailure('Functions cannot be checkpointed safely');
+  const primitiveBytes = typeof value === 'string'
+    ? value.length * 2
+    : typeof value === 'bigint'
+      ? Math.min(4_096, String(value).length * 2)
+      : 16;
   if (
     value === null ||
     typeof value === 'undefined' ||
@@ -3869,14 +4445,17 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
     typeof value === 'number' ||
     typeof value === 'boolean' ||
     typeof value === 'bigint' ||
-    typeof value === 'symbol' ||
-    typeof value === 'function'
+    typeof value === 'symbol'
   ) {
+    const failure = reserveCloneBudget(budget, 1, 0, primitiveBytes);
+    if (failure) return cloneFailure(failure);
     return { ok: true, value };
   }
 
   const existing = budget.seen.get(value);
   if (existing !== undefined) return { ok: true, value: existing };
+  const objectFailure = reserveCloneBudget(budget, 1, 0, 48);
+  if (objectFailure) return cloneFailure(objectFailure);
 
   try {
     if (value instanceof window.Node) return cloneFailure('DOM nodes are live values and cannot be checkpointed');
@@ -3895,11 +4474,16 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
       }
       return { ok: true, value: new RegExp(value.source, value.flags) };
     }
-    if (value instanceof ArrayBuffer) return { ok: true, value: value.slice(0) };
+    if (value instanceof ArrayBuffer) {
+      const failure = reserveBinaryCloneBudget(budget, value.byteLength);
+      return failure ? cloneFailure(failure) : { ok: true, value: value.slice(0) };
+    }
     if (ArrayBuffer.isView(value)) {
       if (Object.getPrototypeOf(value) !== value.constructor.prototype) {
         return cloneFailure(`${value.constructor.name} subclasses cannot be restored safely`);
       }
+      const failure = reserveBinaryCloneBudget(budget, value.byteLength);
+      if (failure) return cloneFailure(failure);
       if (value instanceof DataView) {
         return {
           ok: true,
@@ -3915,20 +4499,32 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
       if (Object.getPrototypeOf(value) !== Array.prototype) {
         return cloneFailure('Array subclasses cannot be restored safely');
       }
-      const output: unknown[] = [];
+      if (value.length > MAX_CHECKPOINT_ARRAY_LENGTH) {
+        return cloneFailure(`Array length exceeds the checkpoint limit of ${MAX_CHECKPOINT_ARRAY_LENGTH}`);
+      }
+      const keys = Object.keys(value);
+      const entryFailure = reserveCloneBudget(
+        budget,
+        0,
+        keys.length,
+        keys.reduce((total, key) => total + key.length * 2, 0)
+      );
+      if (entryFailure) return cloneFailure(entryFailure);
+      const output: unknown[] = new Array(value.length);
       budget.seen.set(value, output);
-      for (let index = 0; index < value.length; index++) {
-        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-        if (!descriptor) {
-          output.length++;
-          continue;
+      for (const key of keys) {
+        const index = Number(key);
+        if (!Number.isSafeInteger(index) || index < 0 || index >= value.length || String(index) !== key) {
+          return cloneFailure(`Array property "${key}" cannot be checkpointed safely`);
         }
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor) return cloneFailure(`Array index ${key} became unavailable`);
         if (!('value' in descriptor)) {
-          return cloneFailure(`Array index ${index} is an accessor and cannot be checkpointed safely`);
+          return cloneFailure(`Array index ${key} is an accessor and cannot be checkpointed safely`);
         }
         const cloned = cloneInner(descriptor.value, depth + 1, budget);
         if (!cloned.ok) return cloned;
-        output.push(cloned.value);
+        output[index] = cloned.value;
       }
       return { ok: true, value: output };
     }
@@ -3936,6 +4532,8 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
       if (Object.getPrototypeOf(value) !== Map.prototype) {
         return cloneFailure(`${value.constructor.name || 'Map'} instances cannot be restored safely`);
       }
+      const entryFailure = reserveCloneBudget(budget, 0, value.size, 0);
+      if (entryFailure) return cloneFailure(entryFailure);
       const output = new Map<unknown, unknown>();
       budget.seen.set(value, output);
       for (const [key, item] of value) {
@@ -3951,6 +4549,8 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
       if (Object.getPrototypeOf(value) !== Set.prototype) {
         return cloneFailure(`${value.constructor.name || 'Set'} instances cannot be restored safely`);
       }
+      const entryFailure = reserveCloneBudget(budget, 0, value.size, 0);
+      if (entryFailure) return cloneFailure(entryFailure);
       const output = new Set<unknown>();
       budget.seen.set(value, output);
       for (const item of value) {
@@ -3967,7 +4567,15 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
     }
     const output = Object.create(prototype) as Record<string, unknown>;
     budget.seen.set(value, output);
-    for (const key of Object.keys(value)) {
+    const keys = Object.keys(value);
+    const entryFailure = reserveCloneBudget(
+      budget,
+      0,
+      keys.length,
+      keys.reduce((total, key) => total + key.length * 2, 0)
+    );
+    if (entryFailure) return cloneFailure(entryFailure);
+    for (const key of keys) {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor) return cloneFailure(`State property "${key}" became unavailable`);
       if (!('value' in descriptor)) {
@@ -3986,6 +4594,28 @@ function cloneInner(value: unknown, depth: number, budget: CloneBudget): CloneRe
   } catch (error) {
     return cloneFailure(errorMessage(error));
   }
+}
+
+function reserveBinaryCloneBudget(budget: CloneBudget, byteLength: number): string | null {
+  if (byteLength > MAX_CHECKPOINT_BINARY_BYTES) {
+    return `Binary state exceeds the checkpoint limit of ${MAX_CHECKPOINT_BINARY_BYTES} bytes`;
+  }
+  return reserveCloneBudget(budget, 0, 1, byteLength);
+}
+
+function reserveCloneBudget(
+  budget: CloneBudget,
+  nodes: number,
+  entries: number,
+  bytes: number
+): string | null {
+  if (nodes > budget.nodes) return 'State exceeds the checkpoint node budget';
+  if (entries > budget.entries) return 'State exceeds the checkpoint entry budget';
+  if (bytes > budget.bytes) return 'State exceeds the checkpoint byte budget';
+  budget.nodes -= nodes;
+  budget.entries -= entries;
+  budget.bytes -= bytes;
+  return null;
 }
 
 function cloneFailure(reason: string): CloneResult {

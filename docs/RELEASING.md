@@ -18,7 +18,7 @@ The release workflow is `.github/workflows/release.yml`.
 2. Run `pnpm install` so the lockfile records the package versions.
 3. Run `pnpm test`, `pnpm check`, and `pnpm build`.
 4. Commit the release and push `main`.
-5. Create and push the matching tag, such as `v0.2.0`.
+5. Create and push the matching tag, such as `v0.3.0`.
 
 The workflow uploads:
 

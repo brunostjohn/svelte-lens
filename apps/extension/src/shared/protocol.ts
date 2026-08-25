@@ -33,6 +33,26 @@ export interface SnapshotNode {
   detail?: JsonValue;
 }
 
+export type RuneObjectFieldKind = 'state' | 'derived';
+
+export interface RuneObjectFieldSummary {
+  name: string;
+  kind: RuneObjectFieldKind;
+  source: SourceLocation;
+}
+
+/** Metadata is eager; rune field values are returned only by inspect-rune-object. */
+export interface RuneObjectSummary {
+  id: string;
+  name: string;
+  file: string;
+  source: SourceLocation;
+  ownerComponentId?: string;
+  fields: RuneObjectFieldSummary[];
+  totalFields: number;
+  truncated: boolean;
+}
+
 export interface HelloPayload {
   svelteVersion: string | null;
   mode: 'dev' | 'production' | 'unknown';
@@ -43,6 +63,7 @@ export interface HelloPayload {
     state: boolean;
     timeTravel: boolean;
     effects?: boolean;
+    runeObjects?: boolean;
   };
 }
 
@@ -51,6 +72,7 @@ export interface SnapshotPayload {
   revision: number;
   capturedAt: number;
   nodes: SnapshotNode[];
+  runeObjects?: RuneObjectSummary[];
 }
 
 export interface TraceRecord {
@@ -115,6 +137,7 @@ export type PageCommand =
   | { kind: 'record'; enabled: boolean }
   | { kind: 'picker'; action: 'start' | 'stop' }
   | { kind: 'highlight'; componentId: string | null; reveal?: boolean }
+  | { kind: 'inspect-rune-object'; requestId: string; objectId: string }
   | {
       kind: 'set-value';
       requestId: string;
@@ -315,6 +338,31 @@ function isSnapshotNode(value: unknown): value is SnapshotNode {
   );
 }
 
+function isRuneObjectField(value: unknown): value is RuneObjectFieldSummary {
+  return (
+    isRecord(value) &&
+    isBoundedString(value.name, 4_096) &&
+    (value.kind === 'state' || value.kind === 'derived') &&
+    isSourceLocation(value.source)
+  );
+}
+
+function isRuneObjectSummary(value: unknown): value is RuneObjectSummary {
+  return (
+    isRecord(value) &&
+    isBoundedString(value.id, 256) &&
+    isBoundedString(value.name, 4_096) &&
+    isBoundedString(value.file, 32_768) &&
+    isSourceLocation(value.source) &&
+    (value.ownerComponentId === undefined || isBoundedString(value.ownerComponentId, 256)) &&
+    Array.isArray(value.fields) &&
+    value.fields.length <= 64 &&
+    value.fields.every(isRuneObjectField) &&
+    isNonNegativeInteger(value.totalFields) &&
+    typeof value.truncated === 'boolean'
+  );
+}
+
 function isHelloPayload(value: unknown): value is HelloPayload {
   if (!isRecord(value) || !isRecord(value.capabilities)) return false;
   const capabilities = value.capabilities;
@@ -326,7 +374,8 @@ function isHelloPayload(value: unknown): value is HelloPayload {
     typeof capabilities.trace === 'boolean' &&
     typeof capabilities.state === 'boolean' &&
     typeof capabilities.timeTravel === 'boolean' &&
-    (capabilities.effects === undefined || typeof capabilities.effects === 'boolean')
+    (capabilities.effects === undefined || typeof capabilities.effects === 'boolean') &&
+    (capabilities.runeObjects === undefined || typeof capabilities.runeObjects === 'boolean')
   );
 }
 
@@ -338,7 +387,11 @@ function isSnapshotPayload(value: unknown): value is SnapshotPayload {
     isFiniteNumber(value.capturedAt) &&
     Array.isArray(value.nodes) &&
     value.nodes.length <= 20_000 &&
-    value.nodes.every(isSnapshotNode)
+    value.nodes.every(isSnapshotNode) &&
+    (value.runeObjects === undefined ||
+      (Array.isArray(value.runeObjects) &&
+        value.runeObjects.length <= 1_000 &&
+        value.runeObjects.every(isRuneObjectSummary)))
   );
 }
 
@@ -428,6 +481,8 @@ export function isPageCommand(value: unknown): value is PageCommand {
         (value.componentId === null || isBoundedString(value.componentId, 256)) &&
         (value.reveal === undefined || typeof value.reveal === 'boolean')
       );
+    case 'inspect-rune-object':
+      return isBoundedString(value.requestId, 256) && isBoundedString(value.objectId, 256);
     case 'set-value':
       return (
         isBoundedString(value.requestId, 256) &&
@@ -461,33 +516,33 @@ export function isPageCommand(value: unknown): value is PageCommand {
 
 export function isPageToContentMessage(value: unknown): value is PageToContentMessage {
   return (
-    isJsonValue(value) &&
     isRecord(value) &&
     value.source === PAGE_SOURCE &&
     value.v === PROTOCOL_VERSION &&
     isBoundedString(value.sessionId, 256) &&
     value.sessionId.length > 0 &&
-    isPageEvent(value.event)
+    isPageEvent(value.event) &&
+    isJsonValue(value)
   );
 }
 
 export function isContentToPageMessage(value: unknown): value is ContentToPageMessage {
   return (
-    isJsonValue(value) &&
     isRecord(value) &&
     value.source === CONTENT_SOURCE &&
     value.v === PROTOCOL_VERSION &&
     (value.sessionId === null || isBoundedString(value.sessionId, 256)) &&
-    isPageCommand(value.command)
+    isPageCommand(value.command) &&
+    isJsonValue(value)
   );
 }
 
 export function isPortMessage(value: unknown): value is PortMessage {
   if (
-    !isJsonValue(value) ||
     !isRecord(value) ||
     value.v !== PROTOCOL_VERSION ||
-    !isBoundedString(value.kind, 64)
+    !isBoundedString(value.kind, 64) ||
+    !isJsonValue(value)
   ) {
     return false;
   }

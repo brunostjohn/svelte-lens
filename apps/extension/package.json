@@ -1,6 +1,6 @@
 {
   "name": "@svelte-lens/extension",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json && tsc --noEmit -p tsconfig.worker.json"
   },
   "dependencies": {
+    "@zag-js/svelte": "1.43.3",
+    "@zag-js/tree-view": "1.43.3",
     "svelte": "^5.56.9"
   },
   "devDependencies": {

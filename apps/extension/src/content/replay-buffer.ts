@@ -18,17 +18,23 @@ export interface ReplayResult {
  */
 export class ReplayBuffer {
   readonly capacity: number;
+  readonly maxBytes: number;
 
   #sessionId: string | null = null;
   #nextSeq = 1;
   #forgottenThrough = 0;
-  #frames: PageFrame[] = [];
+  #bytes = 0;
+  #frames: Array<{ frame: PageFrame; bytes: number }> = [];
 
-  constructor(capacity = 256) {
+  constructor(capacity = 256, maxBytes = 8 * 1024 * 1024) {
     if (!Number.isInteger(capacity) || capacity < 1) {
       throw new RangeError('ReplayBuffer capacity must be a positive integer');
     }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+      throw new RangeError('ReplayBuffer maxBytes must be a positive safe integer');
+    }
     this.capacity = capacity;
+    this.maxBytes = maxBytes;
   }
 
   get sessionId(): string | null {
@@ -43,6 +49,10 @@ export class ReplayBuffer {
     return this.#frames.length;
   }
 
+  get bytes(): number {
+    return this.#bytes;
+  }
+
   append(sessionId: string, event: PageEvent): PageFrame {
     if (sessionId !== this.#sessionId) this.#reset(sessionId);
 
@@ -53,11 +63,16 @@ export class ReplayBuffer {
       seq: this.#nextSeq++,
       event
     };
-    this.#frames.push(frame);
+    const bytes = estimateFrameBytes(frame);
+    this.#frames.push({ frame, bytes });
+    this.#bytes += bytes;
 
-    while (this.#frames.length > this.capacity) {
+    while (this.#frames.length > this.capacity || this.#bytes > this.maxBytes) {
       const forgotten = this.#frames.shift();
-      if (forgotten) this.#forgottenThrough = forgotten.seq;
+      if (forgotten) {
+        this.#bytes = Math.max(0, this.#bytes - forgotten.bytes);
+        this.#forgottenThrough = forgotten.frame.seq;
+      }
     }
     return frame;
   }
@@ -69,11 +84,14 @@ export class ReplayBuffer {
     const through = Math.min(seq, this.latestSeq);
     let removeCount = 0;
     while (removeCount < this.#frames.length) {
-      const frame = this.#frames[removeCount];
-      if (!frame || frame.seq > through) break;
+      const entry = this.#frames[removeCount];
+      if (!entry || entry.frame.seq > through) break;
       removeCount++;
     }
-    if (removeCount > 0) this.#frames.splice(0, removeCount);
+    if (removeCount > 0) {
+      const removed = this.#frames.splice(0, removeCount);
+      for (const entry of removed) this.#bytes = Math.max(0, this.#bytes - entry.bytes);
+    }
     this.#forgottenThrough = Math.max(this.#forgottenThrough, through);
   }
 
@@ -83,7 +101,7 @@ export class ReplayBuffer {
 
     const cursor = requestedSessionId === sessionId ? fromSeq : 0;
     const result: ReplayResult = {
-      frames: this.#frames.filter((frame) => frame.seq > cursor)
+      frames: this.#frames.flatMap(({ frame }) => frame.seq > cursor ? [frame] : [])
     };
 
     if (cursor < this.#forgottenThrough) {
@@ -102,6 +120,16 @@ export class ReplayBuffer {
     this.#sessionId = sessionId;
     this.#nextSeq = 1;
     this.#forgottenThrough = 0;
+    this.#bytes = 0;
     this.#frames = [];
+  }
+}
+
+/** Chrome messaging copies strings, so UTF-16 size is a safe conservative cap. */
+function estimateFrameBytes(frame: PageFrame): number {
+  try {
+    return JSON.stringify(frame).length * 2;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
   }
 }

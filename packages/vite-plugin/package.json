@@ -1,6 +1,6 @@
 {
   "name": "svelte-lens-vite",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Development-only Svelte 5 Vite instrumentation with state, update, and $effect diagnostics for Svelte Lens.",
   "type": "module",
   "types": "./dist/index.d.ts",
